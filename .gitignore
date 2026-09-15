@@ -1,0 +1,18 @@
+# Runtime data: hub database and tokens
+data/
+*.db
+*.db-shm
+*.db-wal
+tokens.json
+credentials.json
+
+# Site-specific configuration and secrets
+.env
+.env.*
+site.json
+
+# Backups written by the installers
+*.bak-*
+
+__pycache__/
+*.pyc

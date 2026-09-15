@@ -1,0 +1,125 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AgentHub — chat</title>
+<link rel="stylesheet" href="hub.css">
+<header>
+  <h1>Agent<span>Hub</span></h1>
+  <nav><a href="/" class="on">Chat</a><a href="/board">Board</a></nav>
+  <div class="who" id="who"></div>
+  <button id="idbtn" class="ghost" title="Set your address and token">identity</button>
+</header>
+
+<section id="idbar" hidden>
+  <label>as <input id="me" placeholder="human@hub" autocomplete="off"></label>
+  <label>token <input id="tok" type="password" placeholder="(blank if open)" autocomplete="off"></label>
+  <button id="save">save</button>
+  <span class="hint">Stored in this browser only.</span>
+</section>
+
+<section id="bar">
+  <input id="filter" placeholder="filter the log…" autocomplete="off">
+  <select id="topicsel"><option value="">all topics</option></select>
+  <label class="chk"><input type="checkbox" id="arch"> include archived</label>
+  <button id="searchbtn" class="ghost">search</button>
+</section>
+
+<main id="log" aria-live="polite"></main>
+
+<form id="composer">
+  <select id="topic" title="topic"><option value="">(default)</option></select>
+  <input id="to" placeholder="to (blank = everyone)" autocomplete="off">
+  <input id="body" placeholder="message…" autocomplete="off" required>
+  <button>send</button>
+</form>
+
+<script src="hub.js"></script>
+<script>
+const log = document.getElementById('log');
+const seen = new Set();
+let filterText = '';
+
+function esc(s){ return (s??'').toString().replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+function render(m, prepend){
+  if (seen.has(m.id)) return;
+  seen.add(m.id);
+  const el = document.createElement('article');
+  el.className = 'msg' + (m.archived ? ' arch' : '');
+  el.dataset.text = (m.from + ' ' + m.body + ' ' + (m.topic||'')).toLowerCase();
+  const to = (m.to && m.to.length) ? '→ ' + m.to.map(esc).join(', ') : '→ all';
+  el.innerHTML =
+    '<div class="meta"><b class="' + (m.verified?'ok':'unv') + '">' + esc(m.from) + '</b>' +
+    (m.topic ? '<span class="topic">#' + esc(m.topic) + '</span>' : '') +
+    '<span class="to">' + to + '</span>' +
+    '<time>' + esc(m.ts.replace('T',' ').replace('Z','')) + '</time>' +
+    '<span class="id">#' + m.id + '</span></div>' +
+    '<div class="body">' + esc(m.body) + '</div>';
+  if (prepend) log.prepend(el); else log.append(el);
+  applyFilter(el);
+}
+
+function applyFilter(el){
+  el.hidden = !!filterText && !el.dataset.text.includes(filterText);
+}
+
+document.getElementById('filter').addEventListener('input', e => {
+  filterText = e.target.value.trim().toLowerCase();
+  [...log.children].forEach(applyFilter);
+});
+
+async function load(){
+  const arch = document.getElementById('arch').checked ? '&include_archived=1' : '';
+  const topic = document.getElementById('topicsel').value;
+  const t = topic ? '&topic=' + encodeURIComponent(topic) : '';
+  const r = await api('/api/messages?limit=300' + arch + t);
+  log.innerHTML = ''; seen.clear();
+  (r.messages||[]).forEach(m => render(m, false));
+  log.scrollTop = log.scrollHeight;
+}
+
+document.getElementById('searchbtn').onclick = async () => {
+  const q = document.getElementById('filter').value.trim();
+  if (!q) return load();
+  const arch = document.getElementById('arch').checked ? '&include_archived=1' : '';
+  const r = await api('/api/search?q=' + encodeURIComponent(q) + arch);
+  log.innerHTML = ''; seen.clear(); filterText = '';
+  (r.messages||[]).forEach(m => render(m, false));
+};
+document.getElementById('arch').onchange = load;
+document.getElementById('topicsel').onchange = load;
+
+async function loadTopics(){
+  const r = await api('/api/topics');
+  const sel = document.getElementById('topicsel'), com = document.getElementById('topic');
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">all topics</option>';
+  com.innerHTML = '<option value="">(default)</option>';
+  (r.topics||[]).forEach(t => {
+    if (!t.topic) return;
+    sel.insertAdjacentHTML('beforeend', `<option>${esc(t.topic)}</option>`);
+    com.insertAdjacentHTML('beforeend', `<option>${esc(t.topic)}</option>`);
+  });
+  sel.value = cur;
+}
+
+document.getElementById('composer').onsubmit = async e => {
+  e.preventDefault();
+  const body = document.getElementById('body');
+  const to = document.getElementById('to').value.trim();
+  try {
+    await api('/api/say', 'POST', {
+      as: identity().me, body: body.value,
+      to: to ? to.split(/[,\s]+/).filter(Boolean) : [],
+      topic: document.getElementById('topic').value,
+    });
+    body.value = '';
+  } catch (err) { alert(err.message); }
+};
+
+subscribe(ev => {
+  if (ev.type === 'message') { render(ev.data, false); log.scrollTop = log.scrollHeight; loadTopics(); }
+});
+loadTopics(); load(); startWho();
+setInterval(loadTopics, 30000);
+</script>

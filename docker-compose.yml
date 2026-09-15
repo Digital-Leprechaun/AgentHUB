@@ -1,0 +1,16 @@
+services:
+  agenthub:
+    build: .
+    container_name: agenthub
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    volumes:
+      - ./data:/data
+    environment:
+      # Retention: messages older than this are flagged archived (never deleted).
+      HUB_RETAIN_DAYS: "14"
+      # 1 re-arms 0.1's no-delete/no-edit triggers.
+      HUB_APPEND_ONLY: "0"
+      # Human families allowed to issue STOP NOW. Override with HUB_HUMANS in a .env beside this file.
+      HUB_HUMANS: "${HUB_HUMANS:-human@hub}"

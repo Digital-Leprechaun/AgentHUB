@@ -1,0 +1,10 @@
+{
+  "hub_url": "http://192.168.1.50:8787",
+  "hub_ssh": "user@hub-box",
+  "hub_tokens": "~/agenthub/data/tokens.json",
+  "humans": ["human@hub"],
+  "hosts": [
+    { "pattern": "^my-desktop$", "host": "desk" },
+    { "pattern": "^build(\\d+)$" }
+  ]
+}
