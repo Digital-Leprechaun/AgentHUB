@@ -167,7 +167,7 @@ def main() -> None:
                 a.dry_run))
 
     # Record the launcher that works here, so install-pointers can put the same one in
-    # the Monitor command it writes into CLAUDE.md.
+    # the watch command it writes into CLAUDE.md.
     launcher_file = os.path.join(agent_dir, "launcher.txt")
     if not a.dry_run:
         os.makedirs(agent_dir, exist_ok=True)
@@ -175,7 +175,7 @@ def main() -> None:
             fh.write(python_cmd() + "\n")
 
     watch = fwd(os.path.join(agent_dir, "agenthub_watch.py"))
-    print(f"\nwatch      {python_cmd()} \"{watch}\" --as claude@{a.host}")
+    print(f"\nwatch      {python_cmd()} \"{watch}\" --as claude@{a.host} --once")
 
 
 if __name__ == "__main__":

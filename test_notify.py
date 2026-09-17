@@ -144,6 +144,34 @@ try:
     call("hub_resume", {"as": "human@hub", "id": s["stop"]["id"]})
     check("the lift prints a line", any("lifted" in l for l in w.settle()), w.lines)
 
+    print("\nwatch --once: exits after the first event")
+    once_cmd = [sys.executable, os.path.join(HERE, "hooks", "agenthub_watch.py"), "--as", "claude@11", "--once"]
+    once_env = dict(os.environ, AGENTHUB_URL=BASE, AGENTHUB_TOKEN=TOK["*@11"])
+    call("hub_inbox", {"as": "claude@11"})  # start with nothing waiting
+    once = subprocess.Popen(once_cmd, env=once_env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            text=True, encoding="utf-8", errors="replace")
+    time.sleep(1.5)
+    check("--once keeps waiting while nothing is waiting", once.poll() is None)
+    call("hub_say", {"as": "codex@11", "body": "First of two.", "to": ["claude@11"]})
+    call("hub_say", {"as": "codex@11", "body": "Second of two.", "to": ["claude@11"]})
+    try:
+        out, _ = once.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        once.kill()
+        out, _ = once.communicate()
+    once_lines = [l for l in out.splitlines() if l.strip()]
+    check("--once exits 0 after an event", once.returncode == 0, once.returncode)
+    check("--once prints exactly one line", len(once_lines) == 1 and "First of two" in once_lines[0], once_lines)
+    try:
+        r = subprocess.run(once_cmd, env=once_env, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=5)
+        relaunch = r.stdout
+    except subprocess.TimeoutExpired:
+        relaunch = None
+    check("relaunched before the inbox is read, --once reports the waiting mail at once",
+          relaunch is not None and "unread" in relaunch, relaunch)
+    call("hub_inbox", {"as": "claude@11"})
+
     print("\nwatch: connecting with mail already waiting")
     call("hub_say", {"as": "claude@11", "body": "Sent while Codex11 had no watch.", "to": ["codex@11"]})
     w2 = Watch("codex@11", TOK["*@11"]); watches.append(w2)

@@ -1,17 +1,29 @@
 #!/usr/bin/env python3
 """AgentHub watch: prints one line whenever a message or stop arrives for an agent.
 
-Built for Claude Code's Monitor tool, which turns each stdout line into a
-notification that wakes the session even when it is idle:
+Two ways to run it in Claude Code, both of which wake the session even when it is idle:
+
+  --once, as a background Bash command (preferred). It exits after the first event, so
+  the finished command is the wake; the agent reads the output and starts it again.
+  Nothing else ever reaches the user's chat:
+
+    Bash({command: "python agenthub_watch.py --as claude@desk --once 2>/dev/null",
+          run_in_background: true})
+
+  Under the Monitor tool, which turns each stdout line into a notification. Monitor
+  expires every 30 minutes, and the desktop app posts a notice in the chat for every
+  expiry, so this is noisy for a watch that runs all day:
 
     Monitor({command: "python agenthub_watch.py --as claude@desk",
              description: "AgentHub messages for claude@desk",
              timeout_ms: 1800000})
 
 It holds the hub's wake socket open (format=text), so the hub pushes each event the
-moment it happens; nothing is polled. It prints only real events -- connecting,
-reconnecting and keepalives stay silent (diagnostics go to stderr), because every
-stdout line interrupts the agent. It reconnects on its own if the hub restarts.
+moment it happens; nothing is polled, and mail already waiting is pushed on connect.
+It prints only real events -- connecting, reconnecting and keepalives stay silent
+(diagnostics go to stderr), because every stdout line interrupts the agent. It
+reconnects on its own if the hub restarts. With --once, losing the hub is not an event
+(a relaunched watch would only report it again); the reconnect after an outage is.
 
 Reads AGENTHUB_URL and AGENTHUB_TOKEN from the environment, or else from
 ~/.agenthub/credentials.json (written by install_hooks.py), so it works however the
@@ -88,9 +100,17 @@ def main() -> None:
             stream.reconfigure(encoding="utf-8", errors="replace")
         except (AttributeError, ValueError):
             pass
-    ap = argparse.ArgumentParser(description="AgentHub watch for Claude Code's Monitor tool")
+    ap = argparse.ArgumentParser(description="AgentHub watch for Claude Code")
     ap.add_argument("--as", dest="addr", required=True)
+    ap.add_argument("--once", action="store_true",
+                    help="exit after the first event (for a background command instead of Monitor)")
     a = ap.parse_args()
+
+    def event(text: str) -> None:
+        print(text, flush=True)
+        if a.once:
+            sys.exit(0)
+
     url = os.environ.get("AGENTHUB_URL", "")
     token = os.environ.get("AGENTHUB_TOKEN", "")
     if not (url and token):
@@ -119,10 +139,10 @@ def main() -> None:
             log(f"connected as {a.addr}")
             backoff, failures = 1, 0
             if warned:
-                print("[AgentHub] watch reconnected; notifications are flowing again.", flush=True)
                 warned = False
+                event("[AgentHub] watch reconnected; notifications are flowing again.")
             for text in frames(s, fh):
-                print(text, flush=True)
+                event(text)
             log("socket closed")
         except Exception as e:  # noqa: BLE001
             failures += 1
@@ -134,8 +154,9 @@ def main() -> None:
             # Tell the agent once if the hub stays unreachable, so silence is not mistaken
             # for an empty inbox.
             if failures == 5 and not warned:
-                print(f"[AgentHub] watch has lost the hub at {url}; retrying. Messages may be "
-                      "waiting -- check hub_inbox when it returns.", flush=True)
+                if not a.once:
+                    print(f"[AgentHub] watch has lost the hub at {url}; retrying. Messages may be "
+                          "waiting -- check hub_inbox when it returns.", flush=True)
                 warned = True
         time.sleep(backoff)
         backoff = min(backoff * 2, 30)

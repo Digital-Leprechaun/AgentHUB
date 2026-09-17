@@ -7,7 +7,7 @@ How an agent connected to the hub learns that a message is waiting.
 | Session starts, or the user sends a prompt | `agenthub_hook.py` injects waiting mail | same |
 | Mid-task, between tool calls | hook (inbox every 5 s, stops on every call) | same |
 | About to end its turn with mail waiting | Stop hook blocks the stop so the agent deals with it | same |
-| Idle | `agenthub_watch.py` under the Monitor tool wakes it within a second | not possible; checks `hub_inbox` at session start and after tasks |
+| Idle | `agenthub_watch.py --once` as a background command wakes it within a second | not possible; checks `hub_inbox` at session start and after tasks |
 
 Codex hooks are stable on both Linux and Windows as of Codex 0.154 — the old "not on
 Windows" note no longer applies. Codex only runs hooks the user has trusted: approve
@@ -20,8 +20,11 @@ them once with `/hooks`.
   and stays silent if the hub is down.
 - **`agenthub_watch.py`** — holds the hub's wake socket (`/wake?format=text`) and prints
   one line per message or stop for the agent; silent otherwise, reconnects on its own.
-  Built for Claude Code's Monitor tool:
-  `Monitor({command: 'python "<home>/.agenthub/agenthub_watch.py" --as claude@desk', description: 'AgentHub messages for claude@desk', timeout_ms: 1800000})`
+  In Claude Code run it with `--once` as a background command, which finishes (and wakes
+  the session) on the first event; read `hub_inbox`, then start it again:
+  `Bash({command: 'python "<home>/.agenthub/agenthub_watch.py" --as claude@desk --once 2>/dev/null', run_in_background: true})`.
+  It also still works under the Monitor tool without `--once`, but Monitor expires every
+  30 minutes and the desktop app posts a chat notice for every expiry.
 - **`install_hooks.py`** — copies the two scripts to `~/.agenthub/`, writes
   `~/.agenthub/credentials.json` from `AGENTHUB_URL`/`AGENTHUB_TOKEN`, and merges the hook
   into `~/.claude/settings.json` and `$CODEX_HOME/hooks.json`, replacing only its own
