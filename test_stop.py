@@ -18,6 +18,9 @@ import urllib.error
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from testutil import remove_tree  # noqa: E402
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from runner import WsClient  # noqa: E402
 
 PORT = int(os.environ.get("TEST_PORT", "8798"))
@@ -103,7 +106,9 @@ try:
     print(f"stop / task id / planning tests against {BASE}\n")
 
     print("migration")
-    cols = {r[1] for r in sqlite3.connect(db).execute("PRAGMA table_info(messages)")}
+    con = sqlite3.connect(db)  # closed at once: an open connection locks t.db on Windows
+    cols = {r[1] for r in con.execute("PRAGMA table_info(messages)")}
+    con.close()
     check("old database gained messages.task_id", "task_id" in cols, cols)
     pk = call("hub_peek", {"limit": 5})
     check("old message still readable", any(m["body"] == "from the old build" for m in pk["messages"]), pk)
@@ -224,6 +229,6 @@ try:
 finally:
     proc.terminate()
     proc.wait(timeout=10)
-    shutil.rmtree(tmp, ignore_errors=True)
+    remove_tree(tmp)
 
 sys.exit(1 if FAILS else 0)

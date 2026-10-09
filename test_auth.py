@@ -16,6 +16,9 @@ import time
 import urllib.error
 import urllib.request
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from testutil import remove_tree  # noqa: E402
+
 PORT = int(os.environ.get("TEST_PORT", "8799"))
 BASE = f"http://127.0.0.1:{PORT}"
 FAILS = []
@@ -106,6 +109,6 @@ try:
 finally:
     proc.terminate()
     proc.wait(timeout=10)
-    shutil.rmtree(tmp, ignore_errors=True)
+    remove_tree(tmp)
 
 sys.exit(1 if FAILS else 0)

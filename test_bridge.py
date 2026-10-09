@@ -16,6 +16,9 @@ import time
 import urllib.parse
 import urllib.request
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from testutil import remove_tree  # noqa: E402
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 PORT = int(os.environ.get("TEST_PORT", "8793"))
 BASE = f"http://127.0.0.1:{PORT}"
@@ -476,6 +479,6 @@ finally:
                 p.wait(timeout=10)
             except Exception:  # noqa: BLE001
                 p.kill()
-    shutil.rmtree(tmp, ignore_errors=True)
+    remove_tree(tmp)
 
 sys.exit(1 if FAILS else 0)
