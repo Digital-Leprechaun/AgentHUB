@@ -14,3 +14,6 @@ services:
       HUB_APPEND_ONLY: "0"
       # Human families allowed to issue STOP NOW. Override with HUB_HUMANS in a .env beside this file.
       HUB_HUMANS: "${HUB_HUMANS:-human@hub}"
+      # An agent family allowed to run hub_flush besides the humans (e.g. the agent that
+      # maintains the hub). Unset: humans only.
+      HUB_FLUSH_FAMILY: "${HUB_FLUSH_FAMILY:-}"

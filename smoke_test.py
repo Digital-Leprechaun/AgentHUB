@@ -43,9 +43,21 @@ def rpc(method, params=None, token=None):
         return json.loads(r.read() or b"{}")
 
 
+_TASKS = {}
+
+
 def call(tool, args, token=None):
     if token is None and args.get("as"):
         token = token_for(args["as"])
+    if tool == "hub_say" and "task_id" not in args and "reply_to" not in args and args.get("as") \
+            and token == token_for(args["as"]):
+        # Every agent message needs a task: file untagged smoke mail under one task per sender.
+        who = args["as"]
+        if who not in _TASKS:
+            t = call("hub_task_create", {"as": who, "title": "smoke traffic"})
+            _TASKS[who] = (t.get("task") or {}).get("id")
+        if _TASKS[who] is not None:
+            args = dict(args, task_id=_TASKS[who])
     r = rpc("tools/call", {"name": tool, "arguments": args}, token)
     res = r.get("result") or {}
     text = (res.get("content") or [{}])[0].get("text", "")
@@ -72,7 +84,7 @@ check("initialize returns a protocolVersion", bool(r.get("result", {}).get("prot
 check("serverInfo names agenthub", r.get("result", {}).get("serverInfo", {}).get("name") == "agenthub", r)
 tools = rpc("tools/list").get("result", {}).get("tools", [])
 names = {t["name"] for t in tools}
-check(f"tools/list returns {len(tools)} tools", len(tools) == 14, sorted(names))
+check(f"tools/list returns {len(tools)} tools", len(tools) == 16, sorted(names))
 check("every tool has an inputSchema", all("inputSchema" in t for t in tools))
 
 print("\nidentity + presence")
@@ -177,9 +189,10 @@ tid = t1.get("task", {}).get("id")
 check("task created as pending", t1.get("task", {}).get("status") == "pending", t1)
 check("task owner defaults to creator", t1.get("task", {}).get("owner") == "claude@desk", t1)
 t2 = call("hub_task_create", {"as": "claude@desk", "title": "Review the diff",
-                              "owner": "claude@desk/reviewer", "parent_id": tid})
-check("subagent task owned by subagent",
-      t2.get("task", {}).get("owner") == "claude@desk/reviewer", t2)
+                              "worker": "claude@desk/reviewer", "parent_id": tid})
+check("a subtask is owned by its Orchestrator and worked by the subagent",
+      t2.get("task", {}).get("owner") == "claude@desk"
+      and t2.get("task", {}).get("worker") == "claude@desk/reviewer", t2)
 check("subagent task rolls up to the family column",
       t2.get("task", {}).get("family") == "claude@desk", t2)
 call("hub_task_update", {"as": "claude@desk", "id": tid, "status": "active"})

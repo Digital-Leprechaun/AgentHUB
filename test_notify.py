@@ -29,6 +29,9 @@ def tok_for(addr):
 
 
 def call(tool, args, token=None):
+    if tool == "hub_say" and "task_id" not in args and "reply_to" not in args and not args.pop("_notask", False):
+        # Every hub message needs a task: file untagged test mail under one shared task.
+        args = dict(args, task_id=_test_task())
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                        "params": {"name": tool, "arguments": args}}).encode()
     req = urllib.request.Request(f"{BASE}/mcp", data=body, headers={"Content-Type": "application/json"})
@@ -37,6 +40,16 @@ def call(tool, args, token=None):
         res = json.loads(r.read())["result"]
     text = res["content"][0]["text"]
     return {"_error": text} if res.get("isError") else json.loads(text)
+
+
+_TASK = []
+
+
+def _test_task():
+    """A task for test mail that does not care which task it is under (made once, by a human)."""
+    if not _TASK:
+        _TASK.append(call("hub_task_create", {"as": "human@hub", "title": "test traffic"})["task"]["id"])
+    return _TASK[0]
 
 
 def check(label, cond, detail=""):
@@ -118,10 +131,10 @@ try:
           lines and "from codex@11" in lines[0] and "hub_inbox" in lines[0], lines)
     call("hub_say", {"as": "codex@11", "body": "Broadcast on the default topic."})
     check("a default-topic broadcast notifies", len(w.settle()) == 2, w.lines)
-    call("hub_say", {"as": "codex@11", "body": "Chatter on a topic nobody here follows.", "topic": "ue5-shaders"})
+    call("hub_say", {"as": "codex@11", "body": "Chatter on a topic nobody here follows.", "topic": "build-cache"})
     check("a named-topic message does NOT wake a non-subscriber", len(w.settle()) == 2, w.lines)
-    call("hub_subscribe", {"as": "claude@desk", "topic": "ue5-shaders"})
-    call("hub_say", {"as": "codex@11", "body": "Now subscribed.", "topic": "ue5-shaders"})
+    call("hub_subscribe", {"as": "claude@desk", "topic": "build-cache"})
+    call("hub_say", {"as": "codex@11", "body": "Now subscribed.", "topic": "build-cache"})
     check("...but does wake a subscriber", len(w.settle()) == 3, w.lines)
     call("hub_say", {"as": "claude@11", "body": "For the reviewer only.", "to": ["claude@desk/reviewer"]})
     check("a message for a subagent does not wake its parent", len(w.settle()) == 3, w.lines)

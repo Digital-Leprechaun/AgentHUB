@@ -92,6 +92,71 @@ def frames(s, fh):
             yield data.decode("utf-8", "replace")
 
 
+def processes() -> dict[int, tuple[int, str]]:
+    """pid -> (parent pid, lowercased executable name), for every process."""
+    out: dict[int, tuple[int, str]] = {}
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        class Entry(ctypes.Structure):
+            _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                        ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
+                        ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                        ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
+                        ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
+        k32 = ctypes.windll.kernel32
+        k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        snap = k32.CreateToolhelp32Snapshot(2, 0)  # TH32CS_SNAPPROCESS
+        e = Entry()
+        e.dwSize = ctypes.sizeof(Entry)
+        ok = k32.Process32FirstW(snap, ctypes.byref(e))
+        while ok:
+            out[e.th32ProcessID] = (e.th32ParentProcessID, e.szExeFile.lower())
+            ok = k32.Process32NextW(snap, ctypes.byref(e))
+        k32.CloseHandle(snap)
+        return out
+    for d in os.listdir("/proc"):
+        if d.isdigit():
+            try:
+                with open(f"/proc/{d}/stat", encoding="utf-8", errors="replace") as fh:
+                    stat = fh.read()
+                name = stat[stat.index("(") + 1:stat.rindex(")")].lower()
+                ppid = int(stat[stat.rindex(")") + 2:].split()[1])
+                out[int(d)] = (ppid, name)
+            except (OSError, ValueError):
+                pass
+    return out
+
+
+def claude_owner() -> int | None:
+    """The Claude Code process this watch was started from, if any (walks up the parents)."""
+    procs, pid = processes(), os.getpid()
+    for _ in range(12):
+        ppid, _name = procs.get(pid, (0, ""))
+        if not ppid or ppid not in procs:
+            return None
+        if procs[ppid][1].startswith("claude"):
+            return ppid
+        pid = ppid
+    return None
+
+
+def exit_with_owner(owner: int) -> None:
+    """A background command outlives the session that started it, so a watch whose
+    session has ended would sit connected forever, making a gone session look
+    reachable. Leave quietly (nothing on stdout) once the owner is gone."""
+    def loop() -> None:
+        while True:
+            time.sleep(20)
+            p = processes().get(owner)
+            if not p or not p[1].startswith("claude"):
+                log(f"Claude process {owner} has ended; watch exiting")
+                os._exit(0)
+    import threading
+    threading.Thread(target=loop, daemon=True).start()
+
+
 def main() -> None:
     # Monitor reads our stdout as UTF-8. On Windows Python would otherwise write the
     # console code page, turning any non-ASCII character in a message into mojibake.
@@ -128,6 +193,9 @@ def main() -> None:
               "and no ~/.agenthub/credentials.json. Run the machine's register-agenthub script.",
               flush=True)
         sys.exit(1)
+    owner = claude_owner()
+    if owner:
+        exit_with_owner(owner)
     u = urllib.parse.urlparse(url)
     host, port = u.hostname, u.port or 80
     path = f"/wake?{urllib.parse.urlencode({'as': a.addr, 'format': 'text'})}"

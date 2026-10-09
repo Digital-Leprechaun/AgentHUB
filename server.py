@@ -55,7 +55,10 @@ APPEND_ONLY = os.environ.get("HUB_APPEND_ONLY", "0") in ("1", "true", "yes")
 # Families that are people, not agents. Only a human may issue a global STOP NOW.
 HUMANS = {h.strip().lower() for h in os.environ.get("HUB_HUMANS", "human@hub").split(",") if h.strip()}
 PLANNING_TURNS = int(os.environ.get("HUB_PLANNING_TURNS", "3"))
-TASK_STATUSES = ("planning", "pending", "active", "blocked", "done")
+# 'elevated': a subtask whose Worker was moved into the desktop app and now runs it as
+# a primary task of its own; for its old Orchestrator it counts as done.
+TASK_STATUSES = ("planning", "pending", "active", "blocked", "done", "elevated")
+CLOSED_STATUSES = ("done", "elevated")
 SWEEP_SECONDS = 3600
 ACTIVE_SECONDS = 90          # seen this recently => "active" on the board
 WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -64,10 +67,37 @@ MAX_BODY = 32000
 MAX_WAIT = 60
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_NAME = "agenthub"
-SERVER_VERSION = "2.0.0"
+SERVER_VERSION = "3.0.0"
+
+# A family-addressed request (claude@desk, anyone@desk) that no bridge claims within
+# this long is escalated to the humans and the sender.
+REQUEST_ESCALATE_SECONDS = int(os.environ.get("HUB_REQUEST_ESCALATE_SECONDS", "60"))
+REQUEST_SWEEP_SECONDS = float(os.environ.get("HUB_REQUEST_SWEEP_SECONDS", "10"))
+SESSION_KEEP_DAYS = 30       # sessions older than this drop out of the bridge's view
+HUB_SENDER = "agenthub@hub"  # the hub's own voice, for escalations
+# Besides the humans, one agent family may flush the queue (HUB_FLUSH_FAMILY, e.g. the
+# agent that maintains the hub); unset means humans only.
+FLUSH_FAMILY = os.environ.get("HUB_FLUSH_FAMILY", "").lower()
 
 ADDR_RE = re.compile(r"^([a-z0-9][a-z0-9._-]{0,31})@([a-z0-9][a-z0-9._-]{0,31})(?:/([a-z0-9][a-z0-9._/-]{0,63}))?$", re.I)
 TOPIC_RE = re.compile(r"^[a-z0-9][a-z0-9._/-]{0,63}$", re.I)
+SID_RE = re.compile(r"^[0-9a-f]{8}$")
+LABEL_RE = re.compile(r"^[a-z][a-z0-9._-]{0,31}$")
+
+
+def sid_of(session_id: str | None) -> str:
+    """The 8-hex session part of an address, from a vendor session id.
+
+    The LAST 8 hex digits: Codex thread ids are UUIDv7, whose leading digits are a
+    timestamp and would collide for sessions started within a minute of each other."""
+    h = re.sub(r"[^0-9a-f]", "", (session_id or "").lower())
+    return h[-8:] if len(h) >= 8 else ""
+
+
+def is_delivery_notice(frm: str) -> bool:
+    """Mail from a wake bridge or from the hub itself: a report about delivering mail."""
+    f = (frm or "").lower()
+    return f == HUB_SENDER or f.endswith("/bridge")
 
 
 def now_iso() -> str:
@@ -109,6 +139,16 @@ class Addr:
 
     def __str__(self) -> str:
         return self.family + (f"/{self.role}" if self.role else "")
+
+
+def norm_company(c: str | None) -> str:
+    """A company label: lower case letters, digits, '.', '_' and '-' ('' for none)."""
+    return re.sub(r"[^a-z0-9._-]", "", (c or "").strip().lower())[:64]
+
+
+def norm_title(t: str | None) -> str:
+    """A session title: one line, at most 120 characters ('' for none)."""
+    return " ".join((t or "").split())[:120]
 
 
 def norm_topic(t: str | None) -> str:
@@ -158,6 +198,26 @@ CREATE TABLE IF NOT EXISTS agents(
   ws_open    INTEGER NOT NULL DEFAULT 0
 );
 
+-- A session resumed under a new session id (newer Claude CLIs give a resumed
+-- conversation a fresh id): mail for the old address follows it to the new one.
+CREATE TABLE IF NOT EXISTS successors(
+  old TEXT PRIMARY KEY,
+  new TEXT NOT NULL,
+  ts  TEXT NOT NULL
+);
+
+-- A request to move a terminal session into the Claude desktop app on its own
+-- machine. That machine's wake bridge carries it out (an agent session may not open
+-- one itself) and reports back. state: open | done | failed.
+CREATE TABLE IF NOT EXISTS escalations(
+  id      INTEGER PRIMARY KEY AUTOINCREMENT,
+  session TEXT NOT NULL,
+  frm     TEXT NOT NULL,
+  ts      TEXT NOT NULL,
+  state   TEXT NOT NULL DEFAULT 'open',
+  note    TEXT NOT NULL DEFAULT ''
+);
+
 CREATE TABLE IF NOT EXISTS cursors(
   address   TEXT PRIMARY KEY,
   last_read INTEGER NOT NULL DEFAULT 0
@@ -179,8 +239,9 @@ CREATE TABLE IF NOT EXISTS tasks(
   vendor    TEXT NOT NULL,
   host      TEXT NOT NULL,
   topic     TEXT NOT NULL DEFAULT '',
-  status    TEXT NOT NULL DEFAULT 'pending',  -- planning|pending|active|blocked|done
+  status    TEXT NOT NULL DEFAULT 'pending',  -- planning|pending|active|blocked|done|elevated
   parent_id INTEGER,
+  worker    TEXT,
   created   TEXT NOT NULL,
   updated   TEXT NOT NULL,
   done_at   TEXT
@@ -209,6 +270,25 @@ CREATE TABLE IF NOT EXISTS stops(
   lifted_ts TEXT,
   lifted_by TEXT
 );
+
+-- A message to a family (claude@desk) or to anyone@host that routing could not
+-- narrow to one session is a request: one session, usually a new one started by the
+-- host's wake bridge, claims it. state: open | unclaimed (no bridge could take it) |
+-- claimed | assigned (no spawner; given to the most recently active session) |
+-- legacy (delivered the pre-session way) | failed.
+CREATE TABLE IF NOT EXISTS requests(
+  msg_id     INTEGER NOT NULL,
+  target     TEXT    NOT NULL,
+  state      TEXT    NOT NULL,
+  created    TEXT    NOT NULL,
+  claimed_by TEXT,
+  claimed_at TEXT,
+  escalated  INTEGER NOT NULL DEFAULT 0,
+  note       TEXT    NOT NULL DEFAULT '',
+  PRIMARY KEY(msg_id, target)
+);
+CREATE INDEX IF NOT EXISTS ix_req_state ON requests(state, target);
+CREATE INDEX IF NOT EXISTS ix_req_claim ON requests(claimed_by, msg_id);
 """
 
 # Installed only when HUB_APPEND_ONLY=1, and dropped again when it is off, so the
@@ -268,10 +348,41 @@ class Store:
         # Hook events tell the hub which session an agent is running and whether it is
         # busy; the Codex wake bridge needs both to wake the right session at the right time.
         acols = {r[1] for r in self.db.execute("PRAGMA table_info(agents)")}
-        for col in ("session_id", "last_event", "last_event_at"):
+        # kind='session' marks a vendor@host/<sid> address registered by its hook; label,
+        # cwd, state (starting|live|ended) and spawned_for belong to sessions.
+        # worker_of: the subtask a Worker session was given (see Store.role_of).
+        for col in ("session_id", "last_event", "last_event_at", "kind", "label", "cwd", "state",
+                    "spawned_for", "company", "title", "worker_of"):
             if col not in acols:
                 self.db.execute(f"ALTER TABLE agents ADD COLUMN {col} TEXT")
                 log(f"migrated: agents.{col} added")
+        tcols = {r[1] for r in self.db.execute("PRAGMA table_info(tasks)")}
+        if "worker" not in tcols:
+            # Who is running a subtask (a Worker session, a hub-using subagent, or a
+            # family until a session takes it); the owner stays its Orchestrator.
+            self.db.execute("ALTER TABLE tasks ADD COLUMN worker TEXT")
+            log("migrated: tasks.worker added")
+        if "orig_to" not in cols:
+            # What the sender wrote, when routing rewrote `recips` (labels, narrowing).
+            self.db.execute("ALTER TABLE messages ADD COLUMN orig_to TEXT")
+            log("migrated: messages.orig_to added")
+        if "workdir" not in cols:
+            # Where a session started for this message should work (a folder on the
+            # target machine); the bridge checks it against its allowed spawn folders.
+            self.db.execute("ALTER TABLE messages ADD COLUMN workdir TEXT")
+            log("migrated: messages.workdir added")
+        if "company" not in cols:
+            # The company (for example acme or widgets) the message is about. The
+            # sender's machine derives it from the sending session's folder; the
+            # receiving machine maps it to its own folder for a new session.
+            self.db.execute("ALTER TABLE messages ADD COLUMN company TEXT")
+            log("migrated: messages.company added")
+        if "title" not in cols:
+            # The sending session's title (what the user named it in the Claude app), so a
+            # session started for the message can be named after the conversation.
+            self.db.execute("ALTER TABLE messages ADD COLUMN title TEXT")
+            log("migrated: messages.title added")
+        self.spawners: dict[str, int] = {}  # family -> open spawn-capable bridge sockets
         self.db.executescript(APPEND_ONLY_ON if APPEND_ONLY else APPEND_ONLY_OFF)
         log(f"append-only: {'ENFORCED' if APPEND_ONLY else 'off'}")
         self.fts = True
@@ -343,6 +454,125 @@ class Store:
             self.db.execute("UPDATE agents SET ws_open=? WHERE address=?", (1 if open_ else 0, address))
             self.db.commit()
 
+    # -- sessions -----------------------------------------------------------
+    def register_session(self, address: str, session_id: str, cwd: str = "",
+                         state: str = "live", spawned_for: int | None = None,
+                         company: str = "", title: str = "") -> None:
+        """Record vendor@host/<sid> as a session. Its hook calls this on every event."""
+        a = Addr.parse(address)
+        ts = now_iso()
+        with self.lock:
+            self.db.execute(
+                "INSERT INTO agents(address,family,vendor,host,role,first_seen,last_seen,kind,"
+                "session_id,cwd,state,spawned_for,company,title)"
+                " VALUES(?,?,?,?,?,?,?,'session',?,?,?,?,?,?)"
+                " ON CONFLICT(address) DO UPDATE SET kind='session', last_seen=excluded.last_seen,"
+                " session_id=excluded.session_id, cwd=COALESCE(NULLIF(excluded.cwd,''), agents.cwd),"
+                " state=excluded.state, spawned_for=COALESCE(excluded.spawned_for, agents.spawned_for),"
+                " company=COALESCE(NULLIF(excluded.company,''), agents.company),"
+                " title=COALESCE(NULLIF(excluded.title,''), agents.title)",
+                (str(a).lower(), a.family, a.vendor, a.host, a.role.lower(), ts, ts,
+                 session_id, (cwd or "")[:260], state, spawned_for, norm_company(company),
+                 norm_title(title)),
+            )
+            self.db.commit()
+
+    def session_base(self, address: str) -> str | None:
+        """The registered session (vendor@host/<sid>) that `address` is or belongs to."""
+        fam, _, role = (address or "").lower().partition("/")
+        if not role:
+            return None
+        base = f"{fam}/{role.split('/')[0]}"
+        r = self.one("SELECT 1 FROM agents WHERE address=? AND kind='session'", (base,))
+        return base if r else None
+
+    def company_of(self, address: str) -> str:
+        """The company of the session that `address` is or belongs to, as its hook
+        reported it ('' when unknown)."""
+        base = self.session_base(address)
+        r = self.one("SELECT company FROM agents WHERE address=?", (base,)) if base else None
+        return (r["company"] or "") if r else ""
+
+    def title_of(self, address: str) -> str:
+        """The title of the session that `address` is or belongs to ('' when unknown)."""
+        base = self.session_base(address)
+        r = self.one("SELECT title FROM agents WHERE address=?", (base,)) if base else None
+        return (r["title"] or "") if r else ""
+
+    def kind_of(self, address: str) -> str:
+        """human | anyone | bridge | session | legacy (a family, or a pre-session role)."""
+        a = (address or "").lower()
+        fam, _, role = a.partition("/")
+        if fam in HUMANS:
+            return "human"
+        if fam.split("@")[0] == "anyone":
+            return "anyone"
+        if role == "bridge":
+            return "bridge"
+        if self.session_base(a):
+            return "session"
+        return "legacy"
+
+    def ended(self, address: str) -> bool:
+        r = self.one("SELECT state FROM agents WHERE address=?", ((address or "").lower(),))
+        return bool(r) and r["state"] == "ended"
+
+    def has_sessions(self, family: str) -> bool:
+        return bool(self.one("SELECT 1 FROM agents WHERE family=? AND kind='session' LIMIT 1",
+                             (family.lower(),)))
+
+    def live_sessions(self, family: str) -> list[dict]:
+        """Sessions of a family seen in the last day, most recently active first."""
+        cut = datetime.fromtimestamp(time.time() - 86400, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        rows = self.q("SELECT * FROM agents WHERE family=? AND kind='session'"
+                      " AND COALESCE(state,'live') != 'ended' AND last_seen >= ?"
+                      " ORDER BY COALESCE(last_event_at, last_seen) DESC", (family.lower(), cut))
+        return [dict(r) for r in rows]
+
+    def sessions(self, family: str) -> list[dict]:
+        cut = datetime.fromtimestamp(time.time() - SESSION_KEEP_DAYS * 86400,
+                                     timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        rows = self.q("SELECT * FROM agents WHERE family=? AND kind='session' AND last_seen >= ?"
+                      " ORDER BY last_seen DESC", (family.lower(), cut))
+        return [dict(r) for r in rows]
+
+    def set_label(self, address: str, label: str) -> None:
+        """Give a session a readable alias (claude@desk/parser). One live holder per family."""
+        label = (label or "").strip().lower()
+        if not LABEL_RE.match(label) or SID_RE.match(label) or label in ("bridge",):
+            raise HubError(f"bad label {label!r}: a letter, then letters, digits, . _ - (max 32); "
+                           "not 8 hex digits and not 'bridge'")
+        base = self.session_base(address)
+        if not base or base != address.lower():
+            raise HubError("only a session address (vendor@host/<session>) can take a label; "
+                           "your hook tells you yours at session start")
+        fam = base.split("/")[0]
+        with self.lock:
+            self.db.execute("UPDATE agents SET label=NULL WHERE family=? AND label=?", (fam, label))
+            self.db.execute("UPDATE agents SET label=? WHERE address=?", (label, base))
+            self.db.commit()
+
+    def by_label(self, family: str, label: str) -> str | None:
+        r = self.one("SELECT address FROM agents WHERE family=? AND kind='session' AND label=?",
+                     (family.lower(), label.lower()))
+        return r["address"] if r else None
+
+    def spawner_add(self, family: str, delta: int) -> None:
+        with self.lock:
+            n = self.spawners.get(family, 0) + delta
+            if n > 0:
+                self.spawners[family] = n
+            else:
+                self.spawners.pop(family, None)
+
+    def can_spawn(self, family: str) -> bool:
+        with self.lock:
+            return family in self.spawners
+
+    def spawner_on(self, host: str) -> bool:
+        with self.lock:
+            return any(f.split("@")[1] == host for f in self.spawners)
+
     def who(self) -> list[dict]:
         rows = self.q("SELECT * FROM agents ORDER BY family, role")
         out = []
@@ -353,13 +583,18 @@ class Store:
             except ValueError:
                 seen = 0
             age = now - seen
-            state = "connected" if r["ws_open"] else ("active" if age < ACTIVE_SECONDS else "away")
+            if r["kind"] == "session" and (r["state"] == "ended" or age > 86400):
+                continue  # finished sessions pile up; the board shows only current ones
+            state ="connected" if r["ws_open"] else ("active" if age < ACTIVE_SECONDS else "away")
             out.append(
                 {
                     "address": r["address"], "family": r["family"], "vendor": r["vendor"],
                     "host": r["host"], "role": r["role"], "parent": r["parent"],
                     "last_seen": r["last_seen"], "state": state,
                     "last_event": r["last_event"], "last_event_at": r["last_event_at"],
+                    "kind": r["kind"] or "", "label": r["label"], "cwd": r["cwd"],
+                    "company": r["company"] or "", "title": r["title"] or "",
+                    "session_state": r["state"], "spawned_for": r["spawned_for"],
                     "unread": self.unread_count(r["address"]),
                 }
             )
@@ -367,7 +602,12 @@ class Store:
 
     # -- messages -----------------------------------------------------------
     def post(self, frm: Addr, body: str, recips: list[str], topic: str,
-             reply_to: int | None, verified: bool, task_id: int | None = None) -> dict:
+             reply_to: int | None, verified: bool, task_id: int | None = None,
+             orig_to: list[str] | None = None, requests: list[dict] | None = None,
+             workdir: str | None = None, company: str | None = None,
+             title: str | None = None) -> dict:
+        """`requests` (from Hub.route) are recorded in the same transaction as the
+        message, so no reader can ever see the message without its routing."""
         body = (body or "").strip()
         if not body:
             raise HubError("empty message")
@@ -379,16 +619,26 @@ class Store:
         ts = now_iso()
         with self.lock:
             cur = self.db.execute(
-                "INSERT INTO messages(ts,frm,family,vendor,host,topic,recips,reply_to,verified,body,task_id)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO messages(ts,frm,family,vendor,host,topic,recips,reply_to,verified,body,"
+                "task_id,orig_to,workdir,company,title) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (ts, str(frm), frm.family, frm.vendor, frm.host, topic,
-                 json.dumps(recips), reply_to, 1 if verified else 0, body, task_id),
+                 json.dumps(recips), reply_to, 1 if verified else 0, body, task_id,
+                 json.dumps(orig_to) if orig_to is not None else None, workdir or None,
+                 norm_company(company) or None, norm_title(title) or None),
             )
-            self.db.commit()
             mid = cur.lastrowid
+            for rq in requests or []:
+                self.db.execute(
+                    "INSERT INTO requests(msg_id,target,state,created,claimed_by,claimed_at,note)"
+                    " VALUES(?,?,?,?,?,?,?)",
+                    (mid, rq["target"], rq["state"], ts, rq.get("claimed_by"),
+                     ts if rq.get("claimed_by") else None, rq.get("note", "")),
+                )
+            self.db.commit()
         self._bump()
         return {"id": mid, "ts": ts, "from": str(frm), "topic": topic, "to": recips,
-                "reply_to": reply_to, "verified": verified, "task_id": task_id, "body": body}
+                "reply_to": reply_to, "verified": verified, "task_id": task_id,
+                "company": norm_company(company), "body": body}
 
     @staticmethod
     def _row_to_msg(r: sqlite3.Row) -> dict:
@@ -396,7 +646,8 @@ class Store:
             "id": r["id"], "ts": r["ts"], "from": r["frm"], "topic": r["topic"],
             "to": json.loads(r["recips"]), "reply_to": r["reply_to"],
             "verified": bool(r["verified"]), "archived": bool(r["archived"]),
-            "task_id": r["task_id"], "body": r["body"],
+            "task_id": r["task_id"], "company": (r["company"] or "") if "company" in r.keys() else "",
+            "body": r["body"],
         }
 
     def planning_turns(self, task_id: int) -> int:
@@ -412,40 +663,78 @@ class Store:
     def targeted_at(self, address: str) -> str:
         """SQL fragment: is this message *for* `address`? (notification, not visibility)
 
-        An unaddressed message broadcasts only on the DEFAULT topic. On a named
-        topic it notifies subscribers only -- otherwise topics would not segregate
-        anything and every agent's inbox would carry every conversation. Anyone can
-        still read any topic with peek(); this governs notification alone.
+        A SESSION (vendor@host/<sid>) is notified only of what is aimed at it: mail to
+        its own address, requests it claimed, its own topic subscriptions and
+        @-mentions of its address. Never family mail and never broadcasts -- several
+        sessions of one agent each answering the same message is the failure this
+        exists to prevent. Broadcasts reach sessions as a count in hub_hello.
+
+        Everything else (a bare family, a pre-session role, a human) keeps the old
+        rules, except that family mail that became a request (spawned or handed to a
+        session) is no longer delivered to the family as well.
+
+        An unaddressed message broadcasts only on the DEFAULT topic. On a named topic
+        it notifies subscribers only. Anyone can still read any topic with peek();
+        this governs notification alone.
         """
-        return (
-            "((recips = '[]' AND topic = '')"                  # broadcast on the default topic
-            " OR recips LIKE :exact"                           # addressed to me
-            " OR recips LIKE :fam"                             # addressed to my family
-            " OR topic IN (SELECT topic FROM subs WHERE address = :me)"
-            " OR body LIKE :mention)"
-        )
+        kind = self.kind_of(address)
+        subs = "topic IN (SELECT topic FROM subs WHERE address = :me)"
+        if kind == "session":
+            return ("(recips LIKE :exact OR " + subs + " OR body LIKE :mention"
+                    " OR id IN (SELECT msg_id FROM requests WHERE claimed_by = :me AND state IN ('claimed','assigned')))")
+        if kind in ("anyone", "bridge"):
+            return "(recips LIKE :exact)"
+        parts = ["(recips = '[]' AND topic = '')"]           # broadcast on the default topic
+        if address.lower() != address.split("/")[0].lower():
+            parts.append("recips LIKE :exact")                # addressed to me (a role)
+        parts.append("(recips LIKE :fam AND id NOT IN"        # addressed to my family
+                     " (SELECT msg_id FROM requests WHERE target = :family AND state != 'legacy'))")
+        parts += [subs, "body LIKE :mention"]
+        return "(" + " OR ".join(parts) + ")"
 
     def is_for(self, msg: dict, address: str) -> bool:
-        """Python twin of targeted_at(): does this message notify `address`?"""
-        if msg.get("from") == address:
+        """Python twin of targeted_at(): does this message notify `address`?
+
+        One extra case: a bridge (vendor@host/bridge) is kicked by any mail for its
+        family, its sessions or anyone@its-host, since it acts for all of them."""
+        if (msg.get("from") or "").lower() == address.lower():
             return False
-        family = address.split("/")[0]
-        recips = msg.get("to") or []
+        a = address.lower()
+        family = a.split("/")[0]
+        recips = [r.lower() for r in (msg.get("to") or [])]
         topic = msg.get("topic") or ""
+        mentioned = f"@{a}" in (msg.get("body") or "").lower()
+        kind = self.kind_of(a)
+        if kind == "bridge":
+            anyone = f"anyone@{family.split('@')[1]}"
+            return any(r == anyone or r == family or
+                       (r.startswith(family + "/") and not r.endswith("/bridge")) for r in recips)
+        if kind == "anyone":
+            return False
+        subscribed = bool(topic) and topic in self.subs_of(address)
+        if kind == "session":
+            if a in recips or subscribed or mentioned:
+                return True
+            return bool(self.one("SELECT 1 FROM requests WHERE msg_id=? AND claimed_by=? AND state IN ('claimed','assigned')",
+                                 (msg["id"], a)))
         if not recips and topic == "":
             return True
-        if address in recips or family in recips:
+        if a != family and a in recips:
             return True
-        if topic and topic in self.subs_of(address):
+        if family in recips and not self.one(
+                "SELECT 1 FROM requests WHERE msg_id=? AND target=? AND state != 'legacy'",
+                (msg["id"], family)):
             return True
-        return f"@{address}" in (msg.get("body") or "")
+        return subscribed or mentioned
 
     def _target_args(self, a: Addr) -> dict:
+        me = str(a).lower()
         return {
-            "me": str(a),
-            "exact": f'%"{str(a)}"%',
+            "me": me,
+            "exact": f'%"{me}"%',
             "fam": f'%"{a.family}"%',
-            "mention": f"%@{str(a)}%",
+            "family": a.family,
+            "mention": f"%@{me}%",
         }
 
     def unread_count(self, address: str) -> int:
@@ -461,6 +750,11 @@ class Store:
                f"AND archived=0 AND {self.targeted_at(address)}")
         with self.lock:
             return self.db.execute(sql, args).fetchone()["n"]
+
+    def broadcasts_since(self, hours: int = 24) -> int:
+        cut = datetime.fromtimestamp(time.time() - hours * 3600, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return self.one("SELECT COUNT(*) AS n FROM messages WHERE recips='[]' AND topic=''"
+                        " AND archived=0 AND ts >= ?", (cut,))["n"]
 
     def inbox(self, a: Addr, mark: bool = True, limit: int = 100) -> list[dict]:
         address = str(a)
@@ -562,17 +856,22 @@ class Store:
             self.db.commit()
 
     def task_create(self, actor: Addr, title: str, body: str, owner: Addr,
-                    topic: str, parent_id: int | None) -> dict:
+                    topic: str, parent_id: int | None, worker: str | None = None) -> dict:
         title = (title or "").strip()
         if not title:
             raise HubError("task needs a title")
+        if parent_id is not None:
+            parent = self.task(int(parent_id))
+            if parent.get("parent_id") is not None:
+                raise HubError(f"task {parent_id} is itself a subtask: tasks go two levels deep. Add a "
+                               f"sibling under task {parent['parent_id']} instead")
         ts = now_iso()
         with self.lock:
             cur = self.db.execute(
-                "INSERT INTO tasks(title,body,owner,family,vendor,host,topic,status,parent_id,created,updated)"
-                " VALUES(?,?,?,?,?,?,?,'pending',?,?,?)",
+                "INSERT INTO tasks(title,body,owner,family,vendor,host,topic,status,parent_id,worker,created,updated)"
+                " VALUES(?,?,?,?,?,?,?,'pending',?,?,?,?)",
                 (title, body or "", str(owner), owner.family, owner.vendor, owner.host,
-                 topic, parent_id, ts, ts),
+                 topic, parent_id, (worker or "").strip().lower() or None, ts, ts),
             )
             self.db.commit()
             tid = cur.lastrowid
@@ -587,7 +886,7 @@ class Store:
         return dict(r)
 
     def task_update(self, actor: Addr, tid: int, **fields) -> dict:
-        allowed = {"title", "body", "owner", "status", "topic"}
+        allowed = {"title", "body", "owner", "status", "topic", "worker"}
         sets, args, notes = [], [], []
         cur = self.task(tid)
         for k, v in fields.items():
@@ -595,6 +894,10 @@ class Store:
                 continue
             if k == "status" and v not in TASK_STATUSES:
                 raise HubError("status must be one of " + ", ".join(TASK_STATUSES))
+            if k == "status" and v == "elevated" and cur.get("parent_id") is None:
+                raise HubError("only a subtask can be marked elevated")
+            if k == "worker":
+                v = (v or "").strip().lower() or None
             if k == "owner":
                 o = Addr.parse(v)
                 sets += ["owner=?", "family=?", "vendor=?", "host=?"]
@@ -608,12 +911,15 @@ class Store:
             return cur
         sets.append("updated=?")
         args.append(now_iso())
-        if fields.get("status") == "done":
+        if fields.get("status") in CLOSED_STATUSES:
             sets.append("done_at=?")
             args.append(now_iso())
         args.append(tid)
         with self.lock:
             self.db.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id=?", tuple(args))
+            if fields.get("status") == "elevated":
+                # The Worker now runs this work as an Orchestrator of its own.
+                self.db.execute("UPDATE agents SET worker_of=NULL WHERE worker_of=?", (str(tid),))
             self.db.commit()
         self.task_event(tid, str(actor), "updated", "; ".join(notes))
         self._bump()
@@ -629,7 +935,7 @@ class Store:
             sql += " AND status=?"
             args.append(status)
         elif not include_done:
-            sql += " AND status!='done'"
+            sql += " AND status NOT IN ('done','elevated')"
         sql += " ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'planning' THEN 1"
         sql += " WHEN 'blocked' THEN 2 WHEN 'pending' THEN 3 ELSE 4 END, id DESC"
         out = []
@@ -691,6 +997,389 @@ class Store:
 
     def stops_for(self, address: str) -> list[dict]:
         return [s for s in self.stops_active() if self.stop_applies(s, address)]
+
+    # -- requests -----------------------------------------------------------
+    def requests_open(self, family: str) -> list[dict]:
+        """Open requests a bridge for `family` may claim: to the family, or anyone@host."""
+        host = family.split("@")[1]
+        rows = self.q(
+            "SELECT r.*, m.frm, m.ts, m.topic, m.task_id, m.workdir, m.company, m.title, m.reply_to,"
+            " t.parent_id AS task_parent, t.owner AS task_owner, t.title AS task_title"
+            " FROM requests r"
+            " JOIN messages m ON m.id = r.msg_id"
+            " LEFT JOIN tasks t ON t.id = m.task_id"
+            " WHERE r.state IN ('open','unclaimed') AND (r.target = ? OR r.target = ?)"
+            " ORDER BY r.msg_id", (family.lower(), f"anyone@{host}"))
+        return [dict(r) for r in rows]
+
+    def claim(self, bridge: Addr, msg_id: int, target: str, session_id: str, cwd: str = "") -> str:
+        """Atomically claim a request for a new session of the bridge's family.
+        Exactly one claim wins; the session is registered in state 'starting'."""
+        sid = sid_of(session_id)
+        if not sid:
+            raise HubError("claim needs the new session's id (at least 8 hex digits)")
+        target = (target or "").lower()
+        t = Addr.parse(target)
+        if t.vendor == "anyone":
+            if t.host != bridge.host:
+                raise HubError(f"a bridge on {bridge.host} cannot claim {target}")
+        elif t.family != bridge.family or t.role:
+            raise HubError(f"a bridge for {bridge.family} cannot claim {target}")
+        session = f"{bridge.family}/{sid}"
+        with self.lock:
+            cur = self.db.execute(
+                "UPDATE requests SET state='claimed', claimed_by=?, claimed_at=?"
+                " WHERE msg_id=? AND target=? AND state IN ('open','unclaimed')",
+                (session, now_iso(), int(msg_id), target))
+            self.db.commit()
+            if cur.rowcount != 1:
+                raise HubError(f"request #{msg_id} for {target} is not open (already claimed?)")
+        self.register_session(session, session_id, cwd, state="starting", spawned_for=int(msg_id))
+        self._bump()
+        return session
+
+    def adopt(self, token: str, me: str) -> int:
+        """A started session takes over the requests its bridge claimed for it.
+
+        The bridge claims under a placeholder address made from a random token and
+        puts the token in the new session's prompt; the session's hook hands it back
+        here from its first prompt. (`claude --bg` does not honour --session-id, so
+        the session's real address is only known once its hooks run.) Returns how many
+        requests moved."""
+        me = me.lower()
+        fam = me.split("/")[0]
+        placeholder = f"{fam}/{sid_of(token)}" if sid_of(token) else ""
+        if not placeholder or placeholder == me:
+            return 0
+        with self.lock:
+            row = self.db.execute("SELECT spawned_for FROM agents WHERE address=? AND kind='session'"
+                                  " AND state='starting'", (placeholder,)).fetchone()
+            if not row:
+                return 0
+            cur = self.db.execute("UPDATE requests SET claimed_by=? WHERE claimed_by=? AND state='claimed'",
+                                  (me, placeholder))
+            self.db.execute("UPDATE agents SET spawned_for=? WHERE address=?", (row["spawned_for"], me))
+            self.db.execute("UPDATE agents SET state='ended' WHERE address=?", (placeholder,))
+            self.db.commit()
+            n = cur.rowcount
+        for r in self.q("SELECT m.task_id FROM requests q JOIN messages m ON m.id=q.msg_id"
+                        " WHERE q.claimed_by=? AND m.task_id IS NOT NULL", (me,)):
+            self.make_worker(me, r["task_id"])
+        log(f"{me} adopted {n} request(s) claimed for {placeholder}")
+        self._bump()
+        return n
+
+    def request_fail(self, bridge: Addr, msg_id: int, note: str) -> None:
+        """A bridge could not start the session it claimed for: mark both failed/ended."""
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT claimed_by FROM requests WHERE msg_id=? AND state='claimed'"
+                " AND claimed_by LIKE ?", (int(msg_id), bridge.family + "/%")).fetchall()
+            self.db.execute(
+                "UPDATE requests SET state='failed', note=? WHERE msg_id=? AND state='claimed'"
+                " AND claimed_by LIKE ?", ((note or "")[:500], int(msg_id), bridge.family + "/%"))
+            for r in rows:
+                self.db.execute("UPDATE agents SET state='ended' WHERE address=?", (r["claimed_by"],))
+            self.db.commit()
+
+    def session_dead(self, bridge: Addr, address: str, note: str = "") -> list[dict]:
+        """A bridge found one of its family's sessions gone (archived, deleted): end it,
+        and hand each request it was given to the family's next live session. Returns
+        one entry per request: {msg_id, target, frm, to}, `to` None when nobody is left
+        (that request is failed, for the caller to report)."""
+        address = (address or "").lower()
+        if address.split("/")[0] != bridge.family or self.kind_of(address) != "session":
+            raise HubError(f"a bridge for {bridge.family} cannot end {address}")
+        with self.lock:
+            self.db.execute("UPDATE agents SET state='ended' WHERE address=?", (address,))
+            rows = self.db.execute(
+                "SELECT r.msg_id, r.target, m.frm FROM requests r JOIN messages m ON m.id = r.msg_id"
+                " WHERE r.claimed_by=? AND r.state='assigned'", (address,)).fetchall()
+            self.db.commit()
+        live = [s["address"] for s in self.live_sessions(bridge.family)]
+        out = []
+        with self.lock:
+            for r in rows:
+                sender = self.session_base(r["frm"]) or r["frm"].lower()
+                to = next((a for a in live if a != sender), None)
+                if to:
+                    self.db.execute("UPDATE requests SET claimed_by=?, claimed_at=?, note=?"
+                                    " WHERE msg_id=? AND target=?",
+                                    (to, now_iso(), f"reassigned from {address}: {note}"[:500],
+                                     r["msg_id"], r["target"]))
+                else:
+                    self.db.execute("UPDATE requests SET state='failed', note=? WHERE msg_id=? AND target=?",
+                                    (f"{address} is gone: {note}"[:500], r["msg_id"], r["target"]))
+                out.append({"msg_id": r["msg_id"], "target": r["target"], "frm": r["frm"], "to": to})
+            self.db.commit()
+        self._bump()
+        return out
+
+    def session_respawn(self, bridge: Addr, address: str, msg_ids: list[int], note: str = "") -> list[int]:
+        """A bridge found one of its family's sessions unable to take its mail (gone,
+        hung, or open in an app with nothing to deliver into): end it, and reopen each
+        of `msg_ids` -- unread mail aimed at it -- as a request to the family, so the
+        bridge starts a new terminal session for it. Mail never moves into another
+        live session. Returns the message ids reopened."""
+        address = (address or "").lower()
+        if address.split("/")[0] != bridge.family or self.kind_of(address) != "session":
+            raise HubError(f"a bridge for {bridge.family} cannot respawn {address}")
+        family, ts = bridge.family, now_iso()
+        why = f"respawn: {address} {note}".strip()[:500]
+        out = []
+        with self.lock:
+            self.db.execute("UPDATE agents SET state='ended' WHERE address=?", (address,))
+            for mid in msg_ids:
+                mid = int(mid)
+                if not self.db.execute("SELECT 1 FROM messages WHERE id=?", (mid,)).fetchone():
+                    continue
+                # Already reopened once, and taken (or being taken) by another session:
+                # never start a second one for the same message.
+                if self.db.execute("SELECT 1 FROM requests WHERE msg_id=? AND target=? AND"
+                                   " (state='open' OR (claimed_by IS NOT NULL AND claimed_by != ?))",
+                                   (mid, family, address)).fetchone():
+                    continue
+                cur = self.db.execute(
+                    "UPDATE requests SET state='open', claimed_by=NULL, claimed_at=NULL, escalated=0,"
+                    " created=?, note=? WHERE msg_id=? AND target=?", (ts, why, mid, family))
+                if cur.rowcount == 0:
+                    self.db.execute(
+                        "INSERT INTO requests(msg_id,target,state,created,note) VALUES(?,?,'open',?,?)",
+                        (mid, family, ts, why))
+                # Requests it had taken under another target (anyone@host) are released too.
+                self.db.execute("UPDATE requests SET state='failed', note=? WHERE msg_id=? AND claimed_by=?"
+                                " AND target != ?", (why, mid, address, family))
+                out.append(mid)
+            self.db.commit()
+        log(f"{address} respawned for message(s) {', '.join('#' + str(m) for m in out) or 'none'}: {note}")
+        self._bump()
+        return out
+
+    def succeed(self, old: str, me: str) -> int:
+        """Session `me` is the conversation `old` resumed under a new session id: hand it
+        `old`'s unread mail and taken requests, end `old`, and route later follow-ups
+        for `old` to `me`. Returns how many messages moved."""
+        old, me = (old or "").lower(), (me or "").lower()
+        if old == me or old.split("/")[0] != me.split("/")[0] or self.kind_of(old) != "session":
+            return 0
+        ts = now_iso()
+        with self.lock:
+            row = self.db.execute("SELECT last_read FROM cursors WHERE address=?", (old,)).fetchone()
+            last = row[0] if row else 0
+            mids = [r[0] for r in self.db.execute(
+                "SELECT id FROM messages WHERE id > ? AND recips LIKE ?", (last, f'%"{old}"%'))]
+            for mid in mids:
+                self.db.execute(
+                    "INSERT INTO requests(msg_id,target,state,created,claimed_by,claimed_at,note)"
+                    " VALUES(?,?,'assigned',?,?,?,?) ON CONFLICT(msg_id,target) DO UPDATE SET"
+                    " state='assigned', claimed_by=excluded.claimed_by, claimed_at=excluded.claimed_at",
+                    (mid, old, ts, me, ts, f"resumed from {old}"))
+            self.db.execute("UPDATE requests SET claimed_by=? WHERE claimed_by=? AND state IN ('claimed','assigned')",
+                            (me, old))
+            wo = self.db.execute("SELECT worker_of FROM agents WHERE address=?", (old,)).fetchone()
+            if wo and wo[0]:
+                self.db.execute("UPDATE agents SET worker_of=? WHERE address=?", (wo[0], me))
+            sp = self.db.execute("SELECT spawned_for FROM agents WHERE address=?", (old,)).fetchone()
+            if sp and sp[0]:
+                self.db.execute("UPDATE agents SET spawned_for=COALESCE(spawned_for, ?) WHERE address=?", (sp[0], me))
+            top = self.db.execute("SELECT COALESCE(MAX(id), 0) FROM messages").fetchone()[0]
+            self.db.execute("INSERT INTO cursors(address,last_read) VALUES(?,?) ON CONFLICT(address)"
+                            " DO UPDATE SET last_read=MAX(last_read, excluded.last_read)", (old, top))
+            self.db.execute("UPDATE agents SET state='ended' WHERE address=?", (old,))
+            self.db.execute("INSERT INTO successors(old,new,ts) VALUES(?,?,?) ON CONFLICT(old)"
+                            " DO UPDATE SET new=excluded.new, ts=excluded.ts", (old, me, ts))
+            self.db.commit()
+        log(f"{me} resumed {old}; moved message(s) {', '.join('#' + str(m) for m in mids) or 'none'}")
+        self._bump()
+        return len(mids)
+
+    def successor(self, address: str) -> str:
+        """The live session a resumed conversation now runs as (itself if none)."""
+        a = (address or "").lower()
+        for _ in range(8):
+            r = self.one("SELECT new FROM successors WHERE old=?", (a,))
+            if not r:
+                break
+            a = r["new"]
+        return a
+
+    def escalation_add(self, session: str, frm: str) -> int:
+        with self.lock:
+            cur = self.db.execute("INSERT INTO escalations(session,frm,ts) VALUES(?,?,?)",
+                                  (session.lower(), frm.lower(), now_iso()))
+            self.db.commit()
+        self._bump()
+        return cur.lastrowid
+
+    def escalations_open(self, family: str) -> list[dict]:
+        return [dict(r) for r in self.q("SELECT * FROM escalations WHERE state='open' AND session LIKE ?",
+                                        (family.lower() + "/%",))]
+
+    def escalation_done(self, bridge: Addr, eid: int, ok: bool, note: str) -> dict:
+        row = self.one("SELECT * FROM escalations WHERE id=?", (int(eid),))
+        if not row or row["session"].split("/")[0] != bridge.family:
+            raise HubError(f"a bridge for {bridge.family} cannot settle escalation #{eid}")
+        with self.lock:
+            self.db.execute("UPDATE escalations SET state=?, note=? WHERE id=?",
+                            ("done" if ok else "failed", (note or "")[:500], int(eid)))
+            self.db.commit()
+        return dict(row)
+
+    def flush(self, keep: set[str] | None = None) -> dict:
+        """Clear the queue after a change to the hub or the bridges, so no bridge acts on
+        backlog: every known address is marked as having read everything posted so far,
+        every request still waiting or being worked is closed as 'flushed', and every
+        session not in `keep` (those with a watch connected) is ended, so the board shows
+        only sessions that are really there. Nothing is deleted: the messages
+        stay readable with hub_peek, and an ended session that comes back is live again."""
+        with self.lock:
+            top = self.db.execute("SELECT COALESCE(MAX(id), 0) FROM messages").fetchone()[0]
+            addrs = {r[0] for r in self.db.execute("SELECT address FROM agents")}
+            addrs |= {r[0] for r in self.db.execute("SELECT family FROM agents")}
+            addrs |= {r[0] for r in self.db.execute("SELECT address FROM cursors")}
+            moved = 0
+            for a in addrs:
+                cur = self.db.execute(
+                    "INSERT INTO cursors(address,last_read) VALUES(?,?)"
+                    " ON CONFLICT(address) DO UPDATE SET last_read=MAX(last_read, excluded.last_read)"
+                    " WHERE last_read < excluded.last_read", (a, top))
+                moved += cur.rowcount
+            reqs = self.db.execute(
+                "UPDATE requests SET state='flushed', note=? WHERE msg_id <= ?"
+                " AND state IN ('open','unclaimed','claimed','assigned')",
+                (f"flushed at #{top}", top)).rowcount
+            self.db.commit()
+        self._bump()
+        ended = 0
+        with self.lock:
+            for (a,) in self.db.execute("SELECT address FROM agents WHERE kind='session'"
+                                        " AND COALESCE(state,'live') != 'ended'").fetchall():
+                if a not in (keep or set()):
+                    self.db.execute("UPDATE agents SET state='ended', worker_of=NULL WHERE address=?", (a,))
+                    ended += 1
+            self.db.commit()
+        self._bump()
+        return {"through": top, "addresses_cleared": moved, "requests_closed": reqs, "sessions_ended": ended}
+
+    # -- Orchestrators and Workers --------------------------------------------
+    def role_of(self, address: str) -> tuple[str, int | None]:
+        """('human' | 'system' | 'worker' | 'orchestrator', the Worker's subtask or None).
+
+        A Worker works one subtask for an Orchestrator: a session given a subtask
+        (agents.worker_of), or a hub-using subagent (vendor@host/<sid>/<role>). Every
+        other agent session is an Orchestrator. Elevation is the only way a Worker
+        session becomes an Orchestrator."""
+        a = (address or "").lower()
+        fam = a.split("/")[0]
+        if fam in HUMANS:
+            return "human", None
+        if a == HUB_SENDER or a.endswith("/bridge"):
+            return "system", None
+        if a.count("/") >= 2:
+            r = self.one("SELECT id FROM tasks WHERE worker=? AND status NOT IN ('done','elevated')"
+                         " ORDER BY id DESC LIMIT 1", (a,))
+            return "worker", (r["id"] if r else None)
+        r = self.one("SELECT worker_of FROM agents WHERE address=?", (a,))
+        if r and r["worker_of"]:
+            return "worker", int(r["worker_of"])
+        return "orchestrator", None
+
+    def owns_task(self, address: str, task: dict) -> bool:
+        """Is `address` the Orchestrator of this task (its owner, or the owner's family
+        for tasks filed before sessions had addresses)?"""
+        a = (address or "").lower()
+        o = (task.get("owner") or "").lower()
+        return o == a or ("/" not in o and o == a.split("/")[0]) or self.successor(o) == a
+
+    def worker_may_tag(self, address: str, tid: int) -> bool:
+        """May this Worker tag a message with task `tid`? Its own subtask, a subtask
+        mail was sent to it under (a hand-off), or for a hub-using subagent any task of
+        its parent session's tree."""
+        a = (address or "").lower()
+        try:
+            t = self.task(int(tid))
+        except HubError:
+            return False
+        role, mine = self.role_of(a)
+        if mine == t["id"] or (t.get("worker") or "") == a:
+            return True
+        if a.count("/") >= 2:
+            parent = "/".join(a.split("/")[:2])
+            top = self.task(t["parent_id"]) if t.get("parent_id") else t
+            return self.owns_task(parent, top)
+        return bool(self.one(
+            "SELECT 1 FROM messages WHERE task_id=? AND (recips LIKE ? OR id IN"
+            " (SELECT msg_id FROM requests WHERE claimed_by=?)) LIMIT 1", (t["id"], f'%"{a}"%', a)))
+
+    def make_worker(self, address: str, tid: int | None) -> None:
+        """`address` took mail for subtask `tid`: it is that subtask's Worker. A session
+        that already orchestrates open work of its own is left as it is."""
+        if tid is None:
+            return
+        a = (address or "").lower()
+        try:
+            t = self.task(int(tid))
+        except HubError:
+            return
+        if t.get("parent_id") is None or t["status"] in CLOSED_STATUSES:
+            return
+        if self.one("SELECT 1 FROM tasks WHERE owner=? AND status NOT IN ('done','elevated') LIMIT 1", (a,)):
+            return
+        with self.lock:
+            self.db.execute("UPDATE agents SET worker_of=? WHERE address=?", (str(t["id"]), a))
+            w = (t.get("worker") or "")
+            if not w or "/" not in w or self.ended(w):
+                self.db.execute("UPDATE tasks SET worker=? WHERE id=?", (a, t["id"]))
+            self.db.commit()
+        self._bump()
+
+    def owed_reply(self, address: str) -> dict | None:
+        """The newest mail of the last day that `address` (a session) was asked to act on
+        and has not answered: a request it took, or a HANDOFF / QUESTION sent to it, from
+        an agent, with no later message from this session back to that agent's family.
+        {id, from} or None. The wake bridge reports a session that stops without answering."""
+        a = (address or "").lower()
+        cut = datetime.fromtimestamp(time.time() - 86400, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        row = self.one(
+            "SELECT id, frm FROM messages WHERE ts >= ? AND frm != ? AND frm NOT LIKE '%/bridge'"
+            " AND (id IN (SELECT msg_id FROM requests WHERE claimed_by = ? AND state IN ('claimed','assigned'))"
+            "      OR (recips LIKE ? AND (body LIKE 'HANDOFF%' OR body LIKE 'QUESTION%')))"
+            " ORDER BY id DESC LIMIT 1", (cut, HUB_SENDER, a, f'%"{a}"%'))
+        if not row:
+            return None
+        fam = row["frm"].lower().split("/")[0]
+        mine = a.split("/")[0]
+        # Answered by this session, or by the same conversation resumed under a newer
+        # session id (any session of this family that replies to it, or reports on the
+        # same task to the sender).
+        answered = self.one(
+            "SELECT 1 FROM messages WHERE id > ? AND ("
+            " (frm = ? AND (recips LIKE ? OR reply_to = ?))"
+            " OR (frm LIKE ? AND reply_to = ?)"
+            " OR (frm LIKE ? AND recips LIKE ? AND task_id IS NOT NULL"
+            "     AND task_id = (SELECT task_id FROM messages WHERE id = ?)))",
+            (row["id"], a, f'%"{fam}%', row["id"], f"{mine}/%", row["id"],
+             f"{mine}/%", f'%"{fam}%', row["id"]))
+        return None if answered else {"id": row["id"], "from": row["frm"]}
+
+    def requests_overdue(self) -> list[dict]:
+        """Requests nobody took: 'unclaimed' at once, 'open' after the escalate window.
+        Each is returned once (escalated is set)."""
+        cut = datetime.fromtimestamp(time.time() - REQUEST_ESCALATE_SECONDS,
+                                     timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT r.*, m.frm FROM requests r JOIN messages m ON m.id = r.msg_id"
+                " WHERE r.escalated = 0 AND (r.state = 'unclaimed'"
+                "  OR (r.state = 'open' AND r.created <= ?))", (cut,)).fetchall()
+            for r in rows:
+                self.db.execute("UPDATE requests SET escalated=1 WHERE msg_id=? AND target=?",
+                                (r["msg_id"], r["target"]))
+            self.db.commit()
+        return [dict(r) for r in rows]
+
+    def request_of(self, msg_id: int) -> list[dict]:
+        return [dict(r) for r in self.q("SELECT * FROM requests WHERE msg_id=?", (int(msg_id),))]
 
     # -- retention ----------------------------------------------------------
     def sweep(self) -> int:
@@ -869,6 +1558,9 @@ def render_wake(payload: dict, address: str) -> str | None:
         body = " ".join((m.get("body") or "").split())
         if len(body) > 240:
             body = body[:237] + "..."
+        if is_delivery_notice(m.get("from") or ""):
+            return (f"[AgentHub] message #{m['id']} for {address} from {m['from']}: {body} -- a problem "
+                    "with mail this session sent. Read it with hub_inbox and tell the user.")
         return (f"[AgentHub] message #{m['id']} for {address} from {m['from']}{topic}{task}: "
                 f"{body} -- read it with hub_inbox and reply with hub_say if it concerns you.")
     if kind == "stop":
@@ -968,8 +1660,10 @@ class Watchers:
 # ----------------------------------------------------------------------------
 AS_PROP = {
     "type": "string",
-    "description": "Your address: vendor@host, or vendor@host/role for a subagent. "
-                   "e.g. claude@desk or claude@desk/reviewer. Required on every call.",
+    "description": "Your address. For an agent session this is your SESSION address, "
+                   "vendor@host/<session>, which the AgentHub hook gives you at session start "
+                   "(e.g. claude@desk/3f2a91c0); a subagent appends a role "
+                   "(claude@desk/3f2a91c0/reviewer). Required on every call.",
 }
 
 TOOLS = [
@@ -981,6 +1675,9 @@ TOOLS = [
         "inputSchema": {"type": "object", "required": ["as"], "properties": {
             "as": AS_PROP,
             "parent": {"type": "string", "description": "Parent agent address, if you are a subagent."},
+            "label": {"type": "string", "description": "Optional readable alias for your session, "
+                      "e.g. parser: mail to claude@desk/parser then reaches you. One session holds a "
+                      "label at a time; the newest claim takes it."},
         }},
     },
     {
@@ -993,10 +1690,26 @@ TOOLS = [
             "as": AS_PROP,
             "body": {"type": "string", "description": "Message text."},
             "to": {"type": "array", "items": {"type": "string"},
-                   "description": "Addresses to notify. A family (claude@desk) reaches its "
-                                  "subagents. Empty means broadcast."},
+                   "description": "Addresses to notify. A session address (claude@desk/3f2a91c0) "
+                                  "or label (claude@desk/parser) reaches that one session. A family "
+                                  "(claude@desk) reaches the session this conversation belongs to "
+                                  "when reply_to or task_id points at one; otherwise the machine "
+                                  "starts a NEW session for it. anyone@desk starts a new session "
+                                  "with that machine's default agent. Empty means broadcast."},
             "topic": {"type": "string", "description": "Topic to post under. Omit for the default topic."},
-            "reply_to": {"type": "integer", "description": "Message id this replies to."},
+            "reply_to": {"type": "integer", "description": "Message id this replies to. With no "
+                         "`to`, the reply goes to that message's sender."},
+            "workdir": {"type": "string", "description": "When this mail starts a NEW session (a "
+                        "family or anyone@host), the folder on that machine to start it in, "
+                        "e.g. D:/Work or /srv/projects. It must be one of that machine's allowed "
+                        "spawn folders or inside one; otherwise the machine's default folder is "
+                        "used and the session is told. A reply keeps its conversation's folder. "
+                        "Rarely needed: `company` normally picks the folder."},
+            "company": {"type": "string", "description": "The company this mail is about "
+                        "(e.g. acme, widgets). Omit it: the hub fills it in from your "
+                        "session's folder, or from the conversation you reply to. Set it only when "
+                        "you ask about another company's work. A machine that starts a NEW session "
+                        "for this mail starts it in its own folder for that company."},
             "task_id": {"type": "integer", "description": "The task this message is about. Tag every "
                         "message that concerns a task so its history stays together and "
                         "planning turns can be counted."},
@@ -1056,26 +1769,37 @@ TOOLS = [
     },
     {
         "name": "hub_task_create",
-        "description": "Create a task. It appears on the hub Kanban board under its owner column.",
+        "description": "Create a task (Orchestrators only). Hub work always has a task: file a "
+                       "primary task for the work, then a subtask (parent_id) for each Worker you ask "
+                       "-- another machine, or a subagent of yours that uses the hub -- naming it in "
+                       "`worker`. Workers never create or update tasks: they report to you, and you "
+                       "update the board.",
         "inputSchema": {"type": "object", "required": ["as", "title"], "properties": {
             "as": AS_PROP,
             "title": {"type": "string"},
             "body": {"type": "string"},
             "owner": {"type": "string", "description": "Owning agent. Defaults to you."},
             "topic": {"type": "string"},
-            "parent_id": {"type": "integer", "description": "Parent task id, for a slice of work given to a subagent."},
+            "parent_id": {"type": "integer", "description": "Primary task this is a subtask of (two "
+                          "levels only). Only that task's Orchestrator adds subtasks."},
+            "worker": {"type": "string", "description": "Who runs this subtask: a session address, "
+                       "a subagent address (you/<role>), or a machine's family (claude@11) when the "
+                       "hub will start a session for it."},
             "status": {"type": "string", "enum": list(TASK_STATUSES)},
         }},
     },
     {
         "name": "hub_task_update",
-        "description": "Change a task: status, owner, title or body. Set status to done to move "
-                       "it to the Completed column.",
+        "description": "Change a task (its Orchestrator, or a human). Set status to done to move "
+                       "it to the Completed column; mark a subtask `elevated` when its Worker was moved "
+                       "into the desktop app and now runs it as its own primary task. Change `worker` "
+                       "when another session takes a subtask over.",
         "inputSchema": {"type": "object", "required": ["as", "id"], "properties": {
             "as": AS_PROP,
             "id": {"type": "integer"},
             "status": {"type": "string", "enum": list(TASK_STATUSES)},
             "owner": {"type": "string"},
+            "worker": {"type": "string"},
             "title": {"type": "string"},
             "body": {"type": "string"},
             "topic": {"type": "string"},
@@ -1114,6 +1838,29 @@ TOOLS = [
         }},
     },
     {
+        "name": "hub_escalate",
+        "description": "Move a terminal session into the Claude desktop app on its own machine, "
+                       "so the user can continue that conversation there. The machine's wake bridge "
+                       "stops the background copy and opens the same conversation in the app, then "
+                       "reports back to you. Use it when the user asks for a session to be elevated.",
+        "inputSchema": {"type": "object", "required": ["as", "session"], "properties": {
+            "as": AS_PROP,
+            "session": {"type": "string", "description": "The session to move, e.g. claude@25/3e735983 "
+                                                         "(a label works too)."},
+        }},
+    },
+    {
+        "name": "hub_flush",
+        "description": "Clear the whole queue after a change to the hub or the wake bridges, so "
+                       "nothing acts on old mail: every address is marked as having read everything "
+                       "so far, and waiting requests are closed. Nothing is deleted. Humans and the "
+                       "AgentHub holder only.",
+        "inputSchema": {"type": "object", "required": ["as", "reason"], "properties": {
+            "as": AS_PROP,
+            "reason": {"type": "string", "description": "Why, for the record."},
+        }},
+    },
+    {
         "name": "hub_stops",
         "description": "List stops currently in force.",
         "inputSchema": {"type": "object", "properties": {}},
@@ -1147,6 +1894,121 @@ class Hub:
             if self.store.is_for(msg, w):
                 self.wakers.send_to(w, {"type": "message", "message": msg})
 
+    # -- routing ------------------------------------------------------------
+    def route(self, me: Addr, to: list[str], reply_to, task_id) -> tuple[list[str], list[dict], list[str]]:
+        """Resolve a message's recipients. Returns (recips, requests, notes).
+
+        - A label (claude@desk/parser) resolves to the session holding it.
+        - A bare family is NARROWED to one of its sessions when the conversation
+          already belongs to it: `reply_to` a message that session sent, or `task_id`
+          of a task that session owns. Replies therefore route themselves.
+        - A family that cannot be narrowed, or anyone@host, becomes a request: the
+          host's bridge starts a new session for it. With no spawn-capable bridge for
+          the family it goes to the family's most recently active session instead,
+          and with no sessions at all it is delivered the pre-session way.
+        """
+        st = self.store
+        me_base = st.session_base(str(me)) or str(me).lower()
+        parent = None
+        if reply_to:
+            r = st.one("SELECT frm FROM messages WHERE id=?", (int(reply_to),))
+            parent = r["frm"] if r else None
+        owner = None
+        if task_id is not None:
+            try:
+                owner = st.task(int(task_id))["owner"]
+            except HubError:
+                owner = None  # post() reports the missing task
+        out, reqs, notes = [], [], []
+        for raw in to:
+            a = Addr.parse(raw)
+            r = str(a).lower()
+            kind = st.kind_of(r)
+            if kind == "anyone":
+                if a.role:
+                    raise HubError(f"{raw}: anyone@host takes no /session part")
+                state = "open" if st.spawner_on(a.host) else "unclaimed"
+                reqs.append({"target": r, "state": state})
+                notes.append(f"{r}: " + ("a bridge on that host will start a new session" if state == "open"
+                                         else f"no bridge on {a.host} can start a session; the humans are told"))
+            elif kind in ("human", "session", "bridge"):
+                pass
+            elif a.role:
+                seg, _, rest = a.role.lower().partition("/")
+                hit = st.by_label(a.family, seg)
+                if hit:
+                    r = hit + (f"/{rest}" if rest else "")
+                    notes.append(f"{raw} -> {r} (label)")
+            else:
+                base = None
+                claimed = None
+                if reply_to:
+                    # A follow-up to a request goes to the session that took it.
+                    row = st.one("SELECT claimed_by FROM requests WHERE msg_id=? AND claimed_by LIKE ?",
+                                 (int(reply_to), r + "/%"))
+                    claimed = row["claimed_by"] if row else None
+                for cand in (parent, claimed, owner):
+                    b = st.session_base(cand) if cand else None
+                    b = st.successor(b) if b else None
+                    # An ended session cannot take a follow-up: it becomes a request, and
+                    # the new session reads the conversation so far from the hub.
+                    if b and b.split("/")[0] == r and b != me_base and not st.ended(b):
+                        base = b
+                        break
+                if base:
+                    notes.append(f"{raw} -> {base} (the session this conversation belongs to)")
+                    r = base
+                elif st.can_spawn(r):
+                    reqs.append({"target": r, "state": "open"})
+                    notes.append(f"{r}: its bridge will start a new session for this")
+                else:
+                    live = [s for s in st.live_sessions(r) if s["address"] != me_base]
+                    if live:
+                        reqs.append({"target": r, "state": "assigned", "claimed_by": live[0]["address"],
+                                     "note": "no spawn-capable bridge; most recently active session"})
+                        notes.append(f"{r}: no bridge can start a session, so it went to "
+                                     f"{live[0]['address']}, its most recently active session")
+                    elif st.has_sessions(r):
+                        # Its sessions have all ended. Queuing into an old one would run the
+                        # request whenever someone next opens it, so tell the humans now.
+                        why = f"{r} has no live session and no bridge that can start one"
+                        reqs.append({"target": r, "state": "unclaimed", "note": why})
+                        notes.append(f"{r}: {why}; the humans and you are told")
+                    else:
+                        reqs.append({"target": r, "state": "legacy"})
+            if r not in out:
+                out.append(r)
+        return out, reqs, notes
+
+    def sweep_requests(self) -> None:
+        """Tell the humans and the sender about requests nobody took."""
+        for rq in self.store.requests_overdue():
+            why = (rq.get("note") or "no bridge on that host can start a session" if rq["state"] == "unclaimed"
+                   else f"no bridge claimed it within {REQUEST_ESCALATE_SECONDS} s")
+            to = sorted(set(HUMANS) | ({rq["frm"]} if "@" in rq["frm"] else set()))
+            msg = self.store.post(Addr.parse(HUB_SENDER),
+                                  f"NOTE message #{rq['msg_id']} for {rq['target']} has no taker: {why}. "
+                                  "It stays open; a bridge that comes back will still take it.",
+                                  to, "agenthub", rq["msg_id"], True)
+            self._notify(msg)
+            log(f"request #{rq['msg_id']} for {rq['target']} escalated: {why}")
+
+    def report_dead_session(self, session: str, note: str, moved: list[dict]) -> None:
+        """After a bridge ended a dead session: log the hand-overs, and tell the humans
+        and the sender about each request no live session was left to take."""
+        for mv in moved:
+            if mv["to"]:
+                log(f"request #{mv['msg_id']} for {mv['target']}: {session} is gone, handed to {mv['to']}")
+                continue
+            to = sorted(set(HUMANS) | ({mv["frm"]} if "@" in mv["frm"] else set()))
+            msg = self.store.post(Addr.parse(HUB_SENDER),
+                                  f"NOTE message #{mv['msg_id']} for {mv['target']} was not delivered: the "
+                                  f"session it went to ({session}) is gone ({note}) and {mv['target']} has "
+                                  "no other live session. Open one there and send it again.",
+                                  to, "agenthub", mv["msg_id"], True)
+            self._notify(msg)
+            log(f"request #{mv['msg_id']} for {mv['target']} failed: {session} is gone, no live session left")
+
     # -- dispatch -----------------------------------------------------------
     def call(self, name: str, args: dict, token: str | None) -> dict:
         fn = getattr(self, f"t_{name}", None)
@@ -1159,6 +2021,11 @@ class Hub:
             if stops:
                 # First key, so it is the first thing an agent reads.
                 result = {"STOP": self.stop_notice(stops), **result}
+        if who and "/" not in str(who) and self.store.kind_of(str(who)) == "legacy" \
+                and self.store.has_sessions(str(who).lower()):
+            result["ADDRESS"] = (f"{who} is the family address, shared by every session on that "
+                                 "machine. Use your own session address (vendor@host/<session>), "
+                                 "given by the AgentHub hook at session start, as `as` on every call.")
         return result
 
     @staticmethod
@@ -1178,6 +2045,8 @@ class Hub:
 
     def _me(self, args: dict, token: str | None) -> Addr:
         a = Addr.parse(args.get("as", ""))
+        if a.vendor == "anyone":
+            raise HubError("anyone@host is a destination, not an identity")
         self.authed(a, token)
         self.store.touch(a, args.get("parent"))
         return a
@@ -1185,8 +2054,12 @@ class Hub:
     # -- tools --------------------------------------------------------------
     def t_hub_hello(self, args: dict, token: str | None) -> dict:
         me = self._me(args, token)
-        return {
-            "you": str(me), "family": me.family,
+        address = str(me).lower()
+        if args.get("label"):
+            self.store.set_label(address, args["label"])
+        kind = self.store.kind_of(address)
+        out = {
+            "you": str(me), "family": me.family, "kind": kind,
             "unread": self.store.unread_count(str(me)),
             "topics_subscribed": self.store.subs_of(str(me)),
             "agents": self.store.who(),
@@ -1194,6 +2067,15 @@ class Hub:
             "note": "Addressing controls notification, not visibility: use hub_peek to read "
                     "anything, including conversations you were not addressed in.",
         }
+        if kind == "session":
+            ag = self.store.agent(address) or {}
+            out["label"] = ag.get("label")
+            out["broadcasts_24h"] = self.store.broadcasts_since(24)
+            out["note"] += (" You are one session: you are notified only of mail to your own "
+                            "address, requests you took, your own topic subscriptions and "
+                            "@-mentions of you. Broadcasts are not pushed to sessions -- "
+                            "broadcasts_24h counts them; read them with hub_peek.")
+        return out
 
     def t_hub_say(self, args: dict, token: str | None) -> dict:
         me = self._me(args, token)
@@ -1202,13 +2084,42 @@ class Hub:
             to = [to]
         for r in to:
             Addr.parse(r)  # validate
+        if not to and args.get("reply_to"):
+            # A reply with no `to` answers the message's sender. It never broadcasts:
+            # a broadcast reply reaches every watch on the family, not the asker.
+            r = self.store.one("SELECT frm FROM messages WHERE id=?", (int(args["reply_to"]),))
+            if r and r["frm"].lower() != str(me).lower():
+                to = [r["frm"]]
         topic = norm_topic(args.get("topic"))
         verified = self.tokens.enforced and self.tokens.verify(me, token)
-        msg = self.store.post(me, args.get("body", ""), to, topic,
-                              args.get("reply_to"), verified, args.get("task_id"))
+        args["task_id"] = self.task_for(me, args)
+        recips, reqs, notes = self.route(me, to, args.get("reply_to"), args.get("task_id"))
+        workdir = str(args.get("workdir") or "").strip()[:260] or None
+        if not workdir and args.get("reply_to"):
+            # A follow-up keeps the folder its conversation started in.
+            r = self.store.one("SELECT workdir FROM messages WHERE id=?", (int(args["reply_to"]),))
+            workdir = r["workdir"] if r else None
+        # Company: as given; else the conversation's; else the sending session's, which
+        # its hook derived from the session's folder on the sender's machine.
+        company = norm_company(args.get("company"))
+        if not company and args.get("reply_to"):
+            r = self.store.one("SELECT company FROM messages WHERE id=?", (int(args["reply_to"]),))
+            company = norm_company(r["company"]) if r else ""
+        if not company:
+            company = self.store.company_of(str(me))
+        msg = self.store.post(me, args.get("body", ""), recips, topic,
+                              args.get("reply_to"), verified, args.get("task_id"),
+                              orig_to=to if recips != [t.lower() for t in to] else None,
+                              requests=reqs, workdir=workdir, company=company,
+                              title=self.store.title_of(str(me)))
         self._notify(msg)
+        for r in recips:
+            if self.store.kind_of(r) == "session" and r != str(me).lower():
+                self.store.make_worker(r, msg["task_id"])
         out = {"posted": msg["id"], "ts": msg["ts"], "topic": topic,
-               "task_id": msg["task_id"], "notified": to or "everyone"}
+               "task_id": msg["task_id"], "notified": recips or "everyone"}
+        if notes:
+            out["routing"] = notes
         if msg["task_id"] is not None and me.family not in HUMANS:
             t = self.store.task(msg["task_id"])
             if t["status"] == "planning":
@@ -1219,6 +2130,30 @@ class Hub:
                                      f"{PLANNING_TURNS}). Consult a human before planning further, "
                                      "unless one told you to dig deep. Execution is not capped.")
         return out
+
+    def task_for(self, me: Addr, args: dict) -> int | None:
+        """The task a message belongs to. Every message from an agent has one: the
+        `task_id` given, else the task of the message it replies to. A Worker may use
+        only its own subtask (or one handed to it)."""
+        role, mine = self.store.role_of(str(me))
+        tid = args.get("task_id")
+        if tid is None and args.get("reply_to"):
+            r = self.store.one("SELECT task_id FROM messages WHERE id=?", (int(args["reply_to"]),))
+            tid = r["task_id"] if r else None
+        if tid is None and role == "worker" and mine is not None:
+            tid = mine
+        if role in ("human", "system"):
+            return int(tid) if tid is not None else None
+        if tid is None:
+            raise HubError(
+                "every hub message needs a task. Orchestrator: create one with hub_task_create "
+                "(and a subtask for each Worker you ask), then pass its task_id. Worker: pass your "
+                "subtask's task_id. A reply_to a message that has a task inherits it.")
+        t = self.store.task(int(tid))  # raises if there is no such task
+        if role == "worker" and not self.store.worker_may_tag(str(me), t["id"]):
+            raise HubError(f"you are a Worker on task {mine}; task {t['id']} is not yours to post "
+                           "under. Tag your messages with your own subtask, or ask your Orchestrator.")
+        return t["id"]
 
     def t_hub_inbox(self, args: dict, token: str | None) -> dict:
         me = self._me(args, token)
@@ -1260,10 +2195,20 @@ class Hub:
 
     def t_hub_task_create(self, args: dict, token: str | None) -> dict:
         me = self._me(args, token)
+        role, mine = self.store.role_of(str(me))
+        if role == "worker":
+            raise HubError(f"you are a Worker on task {mine}: only its Orchestrator manages tasks. "
+                           "Ask your Orchestrator for a new task or a sibling Worker.")
         owner = Addr.parse(args["owner"]) if args.get("owner") else me
+        if args.get("parent_id") is not None and role != "human":
+            parent = self.store.task(int(args["parent_id"]))
+            if not self.store.owns_task(str(me), parent):
+                raise HubError(f"task {parent['id']} belongs to {parent['owner']}: only its "
+                               "Orchestrator adds subtasks to it")
+            owner = me  # a subtask's owner is its Orchestrator; `worker` says who runs it
         t = self.store.task_create(me, args.get("title", ""), args.get("body", ""),
                                    owner, norm_topic(args.get("topic")),
-                                   args.get("parent_id"))
+                                   args.get("parent_id"), args.get("worker"))
         if args.get("status") and args["status"] != "pending":
             t = self.store.task_update(me, t["id"], status=args["status"])
         self.watchers.push("task", t)
@@ -1271,13 +2216,28 @@ class Hub:
 
     def t_hub_task_update(self, args: dict, token: str | None) -> dict:
         me = self._me(args, token)
+        cur = self.store.task(int(args["id"]))
+        role, mine = self.store.role_of(str(me))
+        if role == "worker":
+            raise HubError(f"you are a Worker on task {mine}: tell your Orchestrator "
+                           f"({cur['owner']}) and it updates the task")
+        if role != "human" and not self.store.owns_task(str(me), cur):
+            raise HubError(f"task {cur['id']} belongs to {cur['owner']}: only its Orchestrator "
+                           "(or a human) updates it")
         t = self.store.task_update(
             me, int(args["id"]), status=args.get("status"), owner=args.get("owner"),
-            title=args.get("title"), body=args.get("body"),
+            title=args.get("title"), body=args.get("body"), worker=args.get("worker"),
             topic=norm_topic(args["topic"]) if args.get("topic") is not None else None,
         )
         self.watchers.push("task", t)
-        return {"task": t}
+        out = {"task": t}
+        if args.get("status") in CLOSED_STATUSES and t.get("parent_id") is None:
+            left = [x["id"] for x in self.store.q(
+                "SELECT id FROM tasks WHERE parent_id=? AND status NOT IN ('done','elevated')", (t["id"],))]
+            if left:
+                out["WARNING"] = (f"task {t['id']} is closed but its subtask(s) "
+                                  f"{', '.join('#' + str(x) for x in left)} are still open: close them too")
+        return out
 
     def t_hub_tasks(self, args: dict, token: str | None) -> dict:
         inc = args.get("include_done")
@@ -1326,6 +2286,44 @@ class Hub:
         self._notify(msg)
         self._push_stop(s, "resume")
         return {"stop": s}
+
+    def t_hub_escalate(self, args: dict, token: str | None) -> dict:
+        me = self._me(args, token)
+        raw = (args.get("session") or "").strip().lower()
+        a = Addr.parse(raw)
+        target = raw
+        if a.role and self.store.kind_of(raw) != "session":
+            hit = self.store.by_label(a.family, a.role.split("/")[0])
+            target = hit or raw
+        target = self.store.successor(target)
+        if self.store.kind_of(target) != "session" or target.split("@")[0] not in ("claude", "codex"):
+            raise HubError(f"{raw} is not a known Claude or Codex session")
+        eid = self.store.escalation_add(target, str(me))
+        verified = self.tokens.enforced and self.tokens.verify(me, token)
+        msg = self.store.post(me, f"ESCALATE #{eid}: {target} is to be moved into the Claude desktop app "
+                                  f"on its machine, at the request of {me}.", sorted(HUMANS), "agenthub",
+                              None, verified)
+        self._notify(msg)
+        return {"escalation": eid, "session": target,
+                "note": f"the bridge on {target.split('@')[1].split('/')[0]} will move it and report back to you"}
+
+    def t_hub_flush(self, args: dict, token: str | None) -> dict:
+        me = self._me(args, token)
+        if not (self.is_human(me, token) or me.family == FLUSH_FAMILY):
+            raise HubError(f"only a human or the AgentHub holder ({FLUSH_FAMILY}) may flush the queue")
+        reason = (args.get("reason") or "").strip()
+        if not reason:
+            raise HubError("say why the queue is being flushed")
+        out = self.store.flush(keep={a.lower() for a in self.wakers.addresses()})
+        verified = self.tokens.enforced and self.tokens.verify(me, token)
+        msg = self.store.post(me, f"FLUSH: every message through #{out['through']} is marked read, "
+                                  f"{out['requests_closed']} waiting request(s) are closed and "
+                                  f"{out['sessions_ended']} idle session(s) without a watch are ended. Nothing was "
+                                  f"deleted; resend anything still needed. Reason: {reason}",
+                              [], "agenthub", None, verified)
+        self._notify(msg)
+        log(f"queue flushed by {me} through #{out['through']}: {out}")
+        return out
 
     def t_hub_stops(self, args: dict, token: str | None) -> dict:
         return {"stops": self.store.stops_active()}
@@ -1417,8 +2415,9 @@ class Handler(BaseHTTPRequestHandler):
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
                 "instructions": (
                     "AgentHub lets coding agents on this network talk to each other. Call "
-                    "hub_hello first with your address (vendor@host, e.g. claude@desk). Every "
-                    "tool takes `as`. Addressing controls notification, not visibility -- "
+                    "hub_hello first with your session address (vendor@host/<session>, given "
+                    "by the AgentHub hook at session start). Every tool takes `as`. Answer only "
+                    "mail delivered to your own session. Addressing controls notification, not visibility -- "
                     "hub_peek reads any conversation. Track work with hub_task_create / "
                     "hub_task_update so it shows on the board."
                 ),
@@ -1524,10 +2523,15 @@ class Handler(BaseHTTPRequestHandler):
         conn = WsConn(self.rfile, self.wfile, self.connection)
         conn.fmt = "text" if args.get("format") == "text" else "json"
         address = str(me)
+        # A bridge that can start sessions says so; family mail then becomes a request
+        # for it instead of going to an existing session.
+        spawner = me.role == "bridge" and args.get("spawn") in ("1", "true")
         WAKERS.add(address, conn)
         STORE.touch(me)
         STORE.set_ws(address, True)
-        log(f"wake socket open: {address} ({conn.fmt})")
+        if spawner:
+            STORE.spawner_add(me.family, 1)
+        log(f"wake socket open: {address} ({conn.fmt}{', spawner' if spawner else ''})")
         unread = STORE.unread_count(address)
         stops = STORE.stops_for(address)
         if conn.fmt == "text":
@@ -1562,6 +2566,8 @@ class Handler(BaseHTTPRequestHandler):
             conn.close()
             WAKERS.drop(address, conn)
             STORE.set_ws(address, False)
+            if spawner:
+                STORE.spawner_add(me.family, -1)
             log(f"wake socket closed: {address}")
 
     # -- hook endpoint ------------------------------------------------------
@@ -1574,7 +2580,22 @@ class Handler(BaseHTTPRequestHandler):
             self.send_text(f"[agenthub] {e}", 403)
             return
         STORE.touch(me)
-        STORE.note_event(str(me), args.get("event", ""), args.get("session", ""))
+        session = args.get("session", "")
+        event = args.get("event", "")
+        if session and me.role and me.role.lower() == sid_of(session):
+            # The hook addresses itself as vendor@host/<sid of its session>: register it.
+            # A Codex thread the hub started runs one `codex exec` per turn, so it ends
+            # after every turn: for it SessionEnd means idle (the bridge resumes it).
+            ag = STORE.agent(str(me).lower()) or {}
+            idle_end = me.vendor == "codex" and bool(ag.get("spawned_for"))
+            STORE.register_session(str(me), session, args.get("cwd", ""),
+                                   state="ended" if event == "SessionEnd" and not idle_end else "live",
+                                   company=args.get("company", ""), title=args.get("title", ""))
+        STORE.note_event(str(me).lower() if me.role else str(me), event, session)
+        if args.get("adopt") and me.role:
+            STORE.adopt(args["adopt"], str(me))  # before the inbox read below, so it is delivered now
+        if args.get("succeed") and me.role:
+            STORE.succeed(args["succeed"], str(me))  # likewise
         lines: list[str] = []
         stops = STORE.stops_for(str(me))
         if stops:
@@ -1598,6 +2619,12 @@ class Handler(BaseHTTPRequestHandler):
                 task = f" [task {m['task_id']}]" if m.get("task_id") else ""
                 lines.append(f"  #{m['id']} {m['from']}{topic}{task}: {m['body']}")
             lines.append("Reply with hub_say if it concerns you; hub_peek to read more context.")
+            if any(is_delivery_notice(m["from"]) for m in msgs):
+                # The humans do not read the hub: the session that sent the mail is the
+                # one place a failed delivery can reach them.
+                lines.append("A wake bridge or the hub reports a problem with mail sent from this "
+                             "session (not delivered, not picked up, or not answered). Tell the user in your "
+                             "reply to them: which message, to whom, what went wrong, and what he needs to do.")
         self.send_text("\n".join(lines))
 
     # -- pending (for the Codex wake bridge) -------------------------------------
@@ -1615,13 +2642,40 @@ class Handler(BaseHTTPRequestHandler):
             return
         address = str(me)
         unread = STORE.inbox(me, mark=False, limit=100)
-        self.send_json({
+        out = {
             "agent": STORE.agent(address),
             "unread": [{"id": m["id"], "from": m["from"], "to": m["to"], "topic": m["topic"],
                         "ts": m["ts"]} for m in unread],
             "stops": STORE.stops_for(address),
             "now": now_iso(),
-        })
+        }
+        if not me.role:
+            # For the bridge: every session of the family with its unread mail ("direct"
+            # = addressed to it or a request it took, the mail that justifies a wake),
+            # and the requests it may claim.
+            sessions = []
+            for s in STORE.sessions(me.family):
+                sa = Addr.parse(s["address"])
+                mail = STORE.inbox(sa, mark=False, limit=100)
+                claimed = {r["msg_id"] for r in STORE.q(
+                    "SELECT msg_id FROM requests WHERE claimed_by=? AND state IN ('claimed','assigned')", (s["address"],))}
+                s["unread"] = [{"id": m["id"], "from": m["from"], "to": m["to"], "topic": m["topic"],
+                                "ts": m["ts"], "direct": s["address"] in [t.lower() for t in m["to"]]
+                                or m["id"] in claimed} for m in mail]
+                s["stops"] = bool(STORE.stops_for(s["address"]))
+                s["owes_reply"] = STORE.owed_reply(s["address"]) if s.get("state") != "starting" else None
+                sessions.append(s)
+            out["sessions"] = sessions
+            out["requests"] = STORE.requests_open(me.family)
+            out["escalations"] = STORE.escalations_open(me.family)
+        self.send_json(out)
+
+    def bridge_call(self, body: dict) -> Addr:
+        me = Addr.parse(body.get("as", ""))
+        HUB.authed(me, self.token())
+        if me.role != "bridge":
+            raise HubError("only a bridge (vendor@host/bridge) may claim requests")
+        return me
 
     # -- static -------------------------------------------------------------
     def serve_static(self, name: str) -> None:
@@ -1718,6 +2772,30 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(HUB.call("hub_stop", body, self.token()))
             elif path == "/api/resume":
                 self.send_json(HUB.call("hub_resume", body, self.token()))
+            elif path == "/api/claim":
+                me = self.bridge_call(body)
+                session = STORE.claim(me, int(body["msg_id"]), body.get("target", ""),
+                                      body.get("session", ""), body.get("cwd", ""))
+                log(f"request #{body['msg_id']} for {body.get('target')} claimed by {session}")
+                self.send_json({"session": session})
+            elif path == "/api/request/fail":
+                me = self.bridge_call(body)
+                STORE.request_fail(me, int(body["msg_id"]), body.get("note", ""))
+                self.send_json({"ok": True})
+            elif path == "/api/escalation/done":
+                me = self.bridge_call(body)
+                STORE.escalation_done(me, int(body["id"]), bool(body.get("ok")), body.get("note", ""))
+                self.send_json({"ok": True})
+            elif path == "/api/session/respawn":
+                me = self.bridge_call(body)
+                reopened = STORE.session_respawn(me, body.get("session", ""), body.get("msg_ids") or [],
+                                                 body.get("note", ""))
+                self.send_json({"reopened": reopened})
+            elif path == "/api/session/dead":
+                me = self.bridge_call(body)
+                moved = STORE.session_dead(me, body.get("session", ""), body.get("note", ""))
+                HUB.report_dead_session(body.get("session", ""), body.get("note", ""), moved)
+                self.send_json({"moved": moved})
             else:
                 self.send_json({"error": "not found"}, 404)
         except HubError as e:
@@ -1749,6 +2827,15 @@ def sweeper() -> None:
         time.sleep(SWEEP_SECONDS)
 
 
+def request_sweeper() -> None:
+    while True:
+        time.sleep(REQUEST_SWEEP_SECONDS)
+        try:
+            HUB.sweep_requests()
+        except Exception as e:  # noqa: BLE001
+            log(f"request sweep failed: {e!r}")
+
+
 def main() -> None:
     global STORE, TOKENS, HUB
     STORE = Store(DB_PATH)
@@ -1756,6 +2843,7 @@ def main() -> None:
     HUB = Hub(STORE, TOKENS, WAKERS, WATCHERS)
     STORE.sweep()
     threading.Thread(target=sweeper, daemon=True).start()
+    threading.Thread(target=request_sweeper, daemon=True).start()
     mode = "token-authenticated" if TOKENS.enforced else "OPEN (no tokens.json)"
     log(f"{SERVER_NAME} {SERVER_VERSION} on :{PORT}  db={DB_PATH}  auth={mode}")
     log(f"  MCP    POST http://<host>:{PORT}/mcp")

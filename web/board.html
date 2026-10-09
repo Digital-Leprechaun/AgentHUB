@@ -21,8 +21,9 @@
   <input id="ntitle" placeholder="new task title…" autocomplete="off">
   <input id="nowner" placeholder="owner (claude@desk)" autocomplete="off" style="width:200px">
   <button id="add">add task</button>
-  <span class="hint">Columns are agent families (vendor@host). Click a card to move it forward;
-    shift-click a completed one to reopen it.</span>
+  <span class="hint">Columns are agent families (vendor@host). A task's subtasks sit inside its card,
+    each with the Worker running it (↳). Click a card or subtask to move it forward; shift-click a
+    completed one to reopen it.</span>
 </section>
 
 <main class="board" id="board"></main>
@@ -30,8 +31,34 @@
 <script src="hub.js"></script>
 <script>
 const board = document.getElementById('board');
-const ORDER = { active: 0, planning: 1, blocked: 2, pending: 3, done: 4 };
+const ORDER = { active: 0, planning: 1, blocked: 2, pending: 3, done: 4, elevated: 5 };
+const CLOSED = s => s === 'done' || s === 'elevated';
+let KIDS = new Map();  // primary task id -> its subtasks
 const PLANNING_LIMIT = 3;  // HUB_PLANNING_TURNS
+
+// A subtask, inside its primary task's card: who is working it, and its state.
+function sub(t){
+  // The Orchestrator's own hub-using subagents read as "subagent <role>".
+  const w = t.worker || '';
+  const who = !w ? 'unassigned'
+    : w.startsWith((t.owner || '') + '/') ? 'subagent ' + w.slice(t.owner.length + 1) : w;
+  return '<div class="sub ' + t.status + '" data-id="' + t.id + '">' +
+    '<div class="sl"><span class="badge ' + t.status + '">' + t.status + '</span>' +
+    '<span class="st" title="' + escapeHtml(t.title) + '">' + escapeHtml(t.title) + '</span></div>' +
+    '<div class="sm"><span class="sw" title="' + escapeHtml(w) + '">↳ ' + escapeHtml(who) + '</span>' +
+    '<span class="si">#' + t.id + (t.messages ? ' · ' + t.messages + ' msg' : '') + '</span></div></div>';
+}
+
+function subs(t){
+  const ks = KIDS.get(t.id) || [];
+  if (!ks.length) return '';
+  const open = ks.filter(k => !CLOSED(k.status)).sort((a, b) => (ORDER[a.status] - ORDER[b.status]) || a.id - b.id);
+  const closed = ks.filter(k => CLOSED(k.status));
+  return '<div class="subs">' + open.map(sub).join('') +
+    (closed.length ? '<details class="closed"><summary>' + closed.length + ' finished subtask' +
+      (closed.length === 1 ? '' : 's') + '</summary>' + closed.map(sub).join('') + '</details>' : '') +
+    '</div>';
+}
 
 function card(t){
   const turns = t.status === 'planning' && t.planning_turns != null
@@ -44,7 +71,7 @@ function card(t){
     '<div class="f"><span class="badge ' + t.status + '">' + t.status + '</span>' + turns +
     (t.topic ? '<span class="topic">#' + escapeHtml(t.topic) + '</span>' : '') +
     '<span title="task id · messages">#' + t.id + (t.messages ? ' · ' + t.messages + ' msg' : '') + '</span>' +
-    '<span class="owner">' + escapeHtml(t.owner) + '</span></div></div>';
+    '<span class="owner">' + escapeHtml(t.owner) + '</span></div>' + subs(t) + '</div>';
 }
 
 async function paint(){
@@ -60,8 +87,16 @@ async function paint(){
   agents.forEach(a => { if (!fams.has(a.family)) fams.set(a.family, { agents: [], tasks: [] });
                         fams.get(a.family).agents.push(a); });
   const done = [];
+  // Subtasks live inside their primary task's card (Orchestrators and Workers);
+  // one whose primary task is not listed is shown on its own.
+  const ids = new Set(tasks.map(t => t.id));
+  KIDS = new Map();
+  tasks.forEach(t => { if (t.parent_id != null && ids.has(t.parent_id)) {
+    if (!KIDS.has(t.parent_id)) KIDS.set(t.parent_id, []);
+    KIDS.get(t.parent_id).push(t); } });
+  tasks = tasks.filter(t => !(t.parent_id != null && ids.has(t.parent_id)));
   tasks.forEach(t => {
-    if (t.status === 'done') { done.push(t); return; }
+    if (CLOSED(t.status)) { done.push(t); return; }
     const f = t.family || famOf(t.owner);
     if (!fams.has(f)) fams.set(f, { agents: [], tasks: [] });
     fams.get(f).tasks.push(t);
@@ -76,8 +111,14 @@ async function paint(){
       '<div class="agents">' + (d.agents.length
         // A bridge is a service, not a worker: it never reads an inbox, so its unread
         // count would climb forever and mean nothing.
-        ? d.agents.map(a => '<span class="a">' + stateDot(a.state) +
-            escapeHtml(a.role ? a.role : '(main)') +
+        // A session shows its label (if it took one) and its id; hover for its folder.
+        ? d.agents.map(a => '<span class="a"' +
+            (a.kind === 'session' ? ' title="' + escapeHtml((a.cwd || '') +
+              (a.spawned_for ? ' · started for message #' + a.spawned_for : '')) + '"' : '') + '>' +
+            stateDot(a.state) +
+            escapeHtml(a.kind === 'session'
+              ? (a.label ? a.label + ' · ' : '') + a.role + (a.spawned_for ? ' ✦' : '')
+              : (a.role ? a.role : '(main)')) +
             (a.unread && a.role !== 'bridge' ? ' <span class="u">' + a.unread + '</span>' : '') +
             '</span>').join('')
         : '<span class="a">no agent seen</span>') + '</div>' +
@@ -110,11 +151,14 @@ document.getElementById('add').onclick = async () => {
 // A finished card stays finished: reopening needs shift-click, so a stray click on the
 // Completed column cannot quietly send work back to pending.
 board.addEventListener('click', async e => {
-  const el = e.target.closest('.card');
+  if (e.target.closest('summary')) return;  // opening the finished-subtasks list
+  const el = e.target.closest('.sub') || e.target.closest('.card');
   if (!el) return;
+  e.stopPropagation();
   const cur = [...el.classList].find(c => c in ORDER);
-  if (cur === 'done' && !e.shiftKey) return;
-  const next = { planning: 'active', pending: 'active', active: 'done', blocked: 'active', done: 'pending' }[cur];
+  if (CLOSED(cur) && !e.shiftKey) return;
+  const next = { planning: 'active', pending: 'active', active: 'done', blocked: 'active', done: 'pending',
+                 elevated: 'pending' }[cur];
   try {
     await api('/api/task/update', 'POST', { as: identity().me, id: +el.dataset.id, status: next });
     paint();

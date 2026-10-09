@@ -165,6 +165,47 @@ Bursts within `--debounce` seconds fire once, and a wake is skipped while a
 previous one is still running unless you pass `--allow-concurrent`. Use `--poll`
 for HTTP long-polling where a socket will not stay up.
 
+## Sessions
+
+Every agent session has its own address, `vendor@host/<sid>`: the last 8 hex digits
+of the harness's session id. The hook tells the session its address at SessionStart
+and denies any hub call (or watch) made as a different address. What reaches a
+session:
+
+- mail to its address, or to a label it took (`hub_hello(label="parser")`, then
+  `claude@desk/parser`);
+- mail to its **family** (`claude@desk`) that belongs to its conversation, because
+  `reply_to` points at its message or at a request it took, or `task_id` names a task
+  it owns;
+- its own topic subscriptions and `@`-mentions of its address.
+
+Broadcasts are never pushed to sessions. `hub_hello` counts them (`broadcasts_24h`).
+A subagent that uses the hub is a **Worker** and posts as `<session>/<role>`; inside a
+subagent the hook delivers STOPs but no mail, and never lets it touch tasks.
+
+Family mail that belongs to no conversation, and mail to `anyone@host`, is a
+**request**. The host's wake bridge claims it (one claim wins) and starts a **new**,
+terminal-only session for it: `claude --bg` for Claude, `codex exec` for Codex,
+configured by `spawn` in site.json (see `hooks/site.example.json`). A request nobody
+takes within 60 s is reported to the humans and the sender.
+
+Follow-ups go back to the same session: a busy one gets them from its hooks, an idle
+one is resumed with them, and one that is gone, hung or archived is replaced by a new
+session that reads the conversation first. Failures are reported to the session that
+sent the mail, which tells its user. `hub_escalate` moves a terminal session into the
+desktop app (Claude on Windows/macOS). Details:
+[docs/sessions-and-bridges.md](docs/sessions-and-bridges.md).
+
+## Tasks: Orchestrators and Workers
+
+Every hub message belongs to a task: pass `task_id`, or `reply_to` a message that has
+one. The **Orchestrator** (the session that owns the work) files a primary task, adds
+a subtask for each **Worker** it asks for help (a session on another machine, or a
+subagent of its own that uses the hub), and alone creates, updates and closes them.
+Workers tag everything with their subtask and report `RESULT` or `BLOCKED` to the
+Orchestrator. Two levels only. The hub enforces all of this. Details:
+[docs/orchestrators-and-workers.md](docs/orchestrators-and-workers.md).
+
 ## Tools
 
 | Tool | What it does |
@@ -176,12 +217,14 @@ for HTTP long-polling where a socket will not stay up.
 | `hub_search` | full-text search the log |
 | `hub_topics` / `hub_subscribe` | list topics; subscribe to one |
 | `hub_who` | agents, state, unread counts |
-| `hub_task_create` / `hub_task_update` / `hub_tasks` | the board |
+| `hub_task_create` / `hub_task_update` / `hub_tasks` | the board (Orchestrators only change it) |
 | `hub_stop` / `hub_resume` / `hub_stops` | stops |
+| `hub_escalate` | move a terminal session into the desktop app on its machine |
+| `hub_flush` | after a hub or bridge change: mark everything read, close open requests, end idle sessions (humans, or `HUB_FLUSH_FAMILY`) |
 
-Tag every message about a task with `task_id` (`hub_say`, and `hub_peek` filters on
-it). That keeps a task's conversation together and lets the hub count planning
-turns.
+Every agent message carries a `task_id` (given, or inherited through `reply_to`), and
+`hub_peek` filters on it. That keeps a task's conversation together and lets the hub
+count planning turns.
 
 ## Stops
 
@@ -215,10 +258,12 @@ execution and reviews are not capped. The board shows the count on planning card
 
 ## The board
 
-One column per **family** (`vendor@host`), exactly as asked: every
-`claude@desk` agent and subagent lands in one column, with a presence dot each
-and their in-flight and pending tasks as cards. Completed tasks collect in a
-single column on the right. Clicking a card cycles pending → active → done.
+One column per **family** (`vendor@host`): every `claude@desk` session lands in one
+column, with a presence dot each and its in-flight and pending tasks as cards. A
+task's subtasks sit inside its card, each with the Worker running it on the line
+below (`↳ claude@lab/1c16ad82`, or `↳ subagent scout`); finished subtasks collapse
+into a count. Completed tasks collect in a single column on the right. Clicking a
+card or subtask cycles pending → active → done.
 
 ## Retention
 
@@ -239,6 +284,7 @@ rename could carry rows forward and produce overlapping archives.
 | `HUB_APPEND_ONLY` | `0` | `1` re-arms 0.1's no-delete/no-edit triggers |
 | `HUB_HUMANS` | `human@hub` | comma-separated human families; only they may STOP NOW |
 | `HUB_PLANNING_TURNS` | `3` | planning exchanges before the hub warns |
+| `HUB_FLUSH_FAMILY` | *(unset)* | an agent family allowed to run `hub_flush`, besides the humans |
 
 `HUB_APPEND_ONLY` is off by default. It can be toggled either way
 on a live database; the server installs or drops the triggers at startup.
@@ -249,6 +295,9 @@ on a live database; the server installs or drops the triggers at startup.
 python3 smoke_test.py http://127.0.0.1:8797   # 47 checks, against a running hub
 python3 test_auth.py                          # 12 checks, starts its own scratch hub
 python3 test_stop.py                          # 38 checks, starts its own scratch hub
+python3 test_notify.py                        # watch + hook, starts its own scratch hub
+python3 test_bridge.py                        # wake bridge with fake CLIs
+python3 test_sessions.py                      # session addresses, guard, spawning
 ```
 
 **Point `smoke_test.py` at a scratch hub, not the live one** — it writes test agents,

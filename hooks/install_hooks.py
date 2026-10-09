@@ -2,8 +2,10 @@
 """Installs AgentHub notifications for this machine's Claude Code and Codex.
 
   - copies agenthub_hook.py and agenthub_watch.py into ~/.agenthub/
-  - registers agenthub_hook.py for SessionStart, UserPromptSubmit, PostToolUse and
-    Stop in Claude Code (~/.claude/settings.json) and Codex ($CODEX_HOME/hooks.json)
+  - registers agenthub_hook.py for SessionStart, UserPromptSubmit, PostToolUse, Stop,
+    SessionEnd and PreToolUse (the session-address guard) in Claude Code
+    (~/.claude/settings.json) and Codex ($CODEX_HOME/hooks.json). Codex runs a new or
+    changed hook only after it is approved once with /hooks.
 
 Only hook entries whose command runs agenthub_hook.py are touched: earlier ones are
 replaced, everything else in those files is kept, and each file is backed up before
@@ -23,7 +25,10 @@ import shutil
 import sys
 import time
 
-EVENTS = ("SessionStart", "UserPromptSubmit", "PostToolUse", "Stop")
+EVENTS = ("SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "PreToolUse", "SessionEnd")
+# The guard only has work for hub calls and shell commands (a watch started with the
+# wrong address); matching nothing else keeps it off every other tool call.
+GUARD_MATCHER = "mcp__agenthub.*|Bash|PowerShell"
 MARK = "agenthub_hook.py"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -88,6 +93,8 @@ def merge(doc: dict, command: str, claude: bool) -> dict:
         group = {"hooks": [entry]}
         if claude and event == "PostToolUse":
             group = {"matcher": "*", **group}
+        if event == "PreToolUse":
+            group = {"matcher": GUARD_MATCHER, **group}
         kept.append(group)
         hooks[event] = kept
     return doc
@@ -175,7 +182,8 @@ def main() -> None:
             fh.write(python_cmd() + "\n")
 
     watch = fwd(os.path.join(agent_dir, "agenthub_watch.py"))
-    print(f"\nwatch      {python_cmd()} \"{watch}\" --as claude@{a.host} --once")
+    print(f"\nwatch      {python_cmd()} \"{watch}\" --as claude@{a.host}/<session> --once"
+          "\n           (each session's AgentHub hook tells it its own <session> at start)")
 
 
 if __name__ == "__main__":

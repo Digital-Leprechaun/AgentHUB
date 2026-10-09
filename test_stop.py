@@ -85,12 +85,13 @@ json.dump(TOK, open(tokens, "w"))
 
 # A database shaped like the previous build: messages has no task_id column.
 old = sqlite3.connect(db)
-old.executescript("""
+# Dated now: a fixed date ages past the 14-day retention sweep and gets archived.
+old.executescript(f"""
 CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, frm TEXT NOT NULL,
   family TEXT NOT NULL, vendor TEXT NOT NULL, host TEXT NOT NULL, topic TEXT NOT NULL DEFAULT '',
   recips TEXT NOT NULL DEFAULT '[]', reply_to INTEGER, verified INTEGER NOT NULL DEFAULT 0,
   body TEXT NOT NULL, archived INTEGER NOT NULL DEFAULT 0);
-INSERT INTO messages(ts,frm,family,vendor,host,body) VALUES('2026-09-10T00:00:00Z','claude@desk','claude@desk','claude','desk','from the old build');
+INSERT INTO messages(ts,frm,family,vendor,host,body) VALUES('{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}','claude@desk','claude@desk','claude','desk','from the old build');
 """)
 old.commit()
 old.close()
