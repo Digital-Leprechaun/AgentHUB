@@ -74,6 +74,9 @@ tasks owned by an **Orchestrator** and run by **Workers**.
   site.json).
 - `claude` is found in `~/.local/bin` even when the bridge runs as a service without
   the login shell's PATH (Linux systemd).
+- Sessions a bridge starts inherit `AGENTHUB_URL` and `AGENTHUB_TOKEN` (from
+  `credentials.json`), so a bridge run as a service still starts sessions that can
+  reach the hub (Codex reads its token from that variable).
 
 ### Orchestrators and Workers
 
