@@ -74,6 +74,8 @@ LOGIN = {"claude": "claude auth login", "codex": "codex login"}
 # A running `codex exec` with no hook events for this long is taken as hung (a long tool
 # call fires none, so this is far longer than an app session's busy_stale).
 CODEX_HUNG = 900
+# How long to wait for a stopped Claude session to leave `claude agents` before giving up.
+STOP_CONFIRM = 10
 
 
 # ----------------------------------------------------------------------------
@@ -868,15 +870,22 @@ class Bridge:
         except Exception as e:  # noqa: BLE001
             self.log(f"could not stop {entry.get('id')}: {e}")
             return False
-        live = claude_sessions(claude)
-        still = live is None or any((x.get("sessionId") or "").lower() == session.lower()
-                                    and (x.get("status") or "").lower() in ("busy", "running", "idle")
-                                    for x in live)
-        if r.returncode != 0 and still:
-            self.log(f"`claude stop {entry.get('id')}` exited {r.returncode} and the session is still "
-                     f"running: {(r.stdout + r.stderr).strip()[:200]}")
-            return False
-        return True
+        # Gone only when the session list says so: a stop can return before the session
+        # has exited, and a list that cannot be read proves nothing. Wait a little.
+        end = time.time() + STOP_CONFIRM
+        while True:
+            live = claude_sessions(claude)
+            if live is not None and not any(
+                    (x.get("sessionId") or "").lower() == session.lower()
+                    and (x.get("status") or "").lower() in ("busy", "running", "idle") for x in live):
+                return True
+            if time.time() >= end:
+                break
+            time.sleep(1)
+        self.log(f"`claude stop {entry.get('id')}` exited {r.returncode}, but the session "
+                 + ("list could not be read" if live is None else "is still running")
+                 + f": {(r.stdout + r.stderr).strip()[:200]}")
+        return False
 
     def resume(self, addr: str, session: str, entry: dict | None, mail: list[dict], agent: dict,
                now: float) -> None:

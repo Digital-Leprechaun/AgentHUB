@@ -138,6 +138,7 @@ json.dump(TOK, open(tokens, "w"))
 # A fake `claude`: records every call; `claude agents --json` lists AGENTS_FILE (else none).
 CLAUDE_CALLS = os.path.join(tmp, "claude_calls.jsonl")
 AGENTS_FILE = os.path.join(tmp, "agents.json")
+STICKY_FILE = os.path.join(tmp, "stop_is_sticky")
 fake_py = os.path.join(tmp, "fakeclaude.py")
 with open(fake_py, "w", encoding="utf-8") as fh:
     fh.write(
@@ -146,6 +147,17 @@ with open(fake_py, "w", encoding="utf-8") as fh:
         "if args[:1] == ['agents']:\n"
         f"    print(open({AGENTS_FILE!r}).read() if os.path.exists({AGENTS_FILE!r}) else '[]'); sys.exit(0)\n"
         f"open({CLAUDE_CALLS!r}, 'a', encoding='utf-8').write(json.dumps({{'args': args, 'cwd': os.getcwd()}}) + '\\n')\n"
+        # `claude stop <id>` takes the session out of `claude agents`, as the real one
+        # does -- unless STICKY_FILE says this stop "succeeds" but leaves it running.
+        f"if args[:1] == ['stop'] and os.path.exists({AGENTS_FILE!r}) and not os.path.exists({STICKY_FILE!r}):\n"
+        f"    rows = json.load(open({AGENTS_FILE!r}))\n"
+        f"    json.dump([r for r in rows if r.get('id') != args[1]], open({AGENTS_FILE!r}, 'w'))\n"
+        # `claude --bg --resume <id>` runs it again, listed as a background session.
+        "if args[:2] == ['--bg', '--resume']:\n"
+        f"    rows = json.load(open({AGENTS_FILE!r})) if os.path.exists({AGENTS_FILE!r}) else []\n"
+        "    if not any(r.get('sessionId') == args[2] for r in rows):\n"
+        "        rows.append({'id': args[2][:8], 'sessionId': args[2], 'kind': 'background', 'status': 'idle'})\n"
+        f"        json.dump(rows, open({AGENTS_FILE!r}, 'w'))\n"
         "print('backgrounded - fake')\n")
 if os.name == "nt":
     fake_claude = os.path.join(tmp, "claude.cmd")
@@ -548,6 +560,22 @@ try:
     inbox(A)
     hook("claude@desk", "Stop", S1)
 
+    print("\na stop that returns success but leaves the session running is not trusted")
+    open(STICKY_FILE, "w").close()
+    agents({"id": "aaaa0001", "sessionId": S1, "kind": "background", "status": "idle"})
+    n = len(claude_calls())
+    stuck = call("hub_say", {"as": sender, "body": "A will not stop", "to": [A]})["posted"]
+
+    def told_stuck():
+        return [m for m in call("hub_peek", {"limit": 400})["messages"]
+                if m["from"] == "claude@desk/bridge" and f"#{stuck}" in m["body"] and "could not be stopped" in m["body"]]
+    check("the bridge reports it instead of resuming a copy", wait_for(lambda: bool(told_stuck()), 25),
+          calls_since(n))
+    check("and never resumes it", not any("--resume" in c for c in calls_since(n)), calls_since(n))
+    os.remove(STICKY_FILE)
+    inbox(A)
+    agents()
+
     print("\nan idle session open in an app with no watch gets a new terminal session")
     agents({"sessionId": S1, "kind": "interactive", "status": "idle"})
     n = len(claude_calls())
@@ -661,6 +689,24 @@ try:
     spec.loader.exec_module(hk)
     check("the resume marker accepts dotted and hyphenated hosts",
           bool(hk.RESUMED_FROM.search("AgentHub resumed from: claude@build-1.lab_x/0123abcd")))
+
+    print("\na resumed session gets new mail, not work its old self already answered")
+    n = len(claude_calls())
+    first = call("hub_say", {"as": sender, "body": "first job", "to": ["claude@desk"]})["posted"]
+    wait_for(lambda: any(f"AgentHub request #{first} " in c[-1] for c in calls_since(n)), 10)
+    sp = next((c for c in calls_since(n) if f"AgentHub request #{first} " in c[-1]), [""])
+    SX, X = "aaaabbbb-1111-4111-8111-1111bbbb0021", "claude@desk/bbbb0021"
+    SY = "aaaabbbb-2222-4222-8222-2222bbbb0022"
+    hook("claude@desk", "SessionStart", SX)
+    got = hook_text(hook("claude@desk", "UserPromptSubmit", SX, {"prompt": sp[-1]}))
+    check("X takes the first job", "first job" in got, got)
+    call("hub_say", {"as": X, "body": "RESULT done", "to": [sender], "reply_to": first})
+    call("hub_say", {"as": sender, "body": "second job", "to": [X], "task_id": _test_task()})
+    hook("claude@desk", "SessionStart", SY)
+    got = hook_text(hook("claude@desk", "UserPromptSubmit", SY,
+                         {"prompt": f"AgentHub: mail. AgentHub resumed from: {X}"}))
+    check("the resumed session gets the new follow-up", "second job" in got, got)
+    check("but not the job its old self already answered", "first job" not in got, got)
     time.sleep(4)
     check("and nobody is told E ended without answering",
           not any(f"#{m8}" in m["body"] and "without answering" in m["body"] for m in notes_to_sender()),

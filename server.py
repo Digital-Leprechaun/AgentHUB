@@ -697,7 +697,8 @@ class Store:
         subs = "topic IN (SELECT topic FROM subs WHERE address = :me)"
         if kind == "session":
             return ("((recips LIKE :exact OR " + subs + " OR body LIKE :mention"
-                    " OR id IN (SELECT msg_id FROM requests WHERE claimed_by = :me AND state IN ('claimed','assigned')))"
+                    " OR id IN (SELECT msg_id FROM requests WHERE claimed_by = :me AND state IN ('claimed','assigned')"
+                    " AND delivered = 0))"
                     " AND id NOT IN (SELECT msg_id FROM transfers WHERE frm_addr = :me))")
         if kind in ("anyone", "bridge"):
             return "(recips LIKE :exact)"
@@ -734,8 +735,8 @@ class Store:
                 return False  # handed to another session
             if a in recips or subscribed or mentioned:
                 return True
-            return bool(self.one("SELECT 1 FROM requests WHERE msg_id=? AND claimed_by=? AND state IN ('claimed','assigned')",
-                                 (msg["id"], a)))
+            return bool(self.one("SELECT 1 FROM requests WHERE msg_id=? AND claimed_by=? AND state IN ('claimed','assigned')"
+                                 " AND delivered = 0", (msg["id"], a)))
         if not recips and topic == "":
             return True
         if a != family and a in recips:
@@ -1212,7 +1213,9 @@ class Store:
             for (mid,) in self.db.execute("SELECT msg_id FROM requests WHERE claimed_by=? AND state IN"
                                           " ('claimed','assigned')", (old,)).fetchall():
                 self.db.execute("INSERT OR IGNORE INTO transfers(msg_id,frm_addr) VALUES(?,?)", (mid, old))
-            self.db.execute("UPDATE requests SET claimed_by=?, delivered=0 WHERE claimed_by=? AND state IN"
+            # Requests it already held move as they are: one it has read stays delivered,
+            # so the resumed session is not handed old, answered work as new mail.
+            self.db.execute("UPDATE requests SET claimed_by=? WHERE claimed_by=? AND state IN"
                             " ('claimed','assigned')", (me, old))
             wo = self.db.execute("SELECT worker_of FROM agents WHERE address=?", (old,)).fetchone()
             if wo and wo[0]:
