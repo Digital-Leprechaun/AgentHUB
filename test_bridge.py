@@ -90,7 +90,7 @@ def exec_calls():
     # On Windows the bridge puts `-c windows.sandbox="unelevated"` before `exec`.
     out = []
     for c in codex_calls():
-        if c[:2] == ["-c", 'windows.sandbox="unelevated"']:
+        if c[:1] == ["-c"] and len(c) > 1 and c[1].replace("'", '"') == 'windows.sandbox="unelevated"':
             c = c[2:]
         if c[:1] == ["exec"]:
             out.append(c)
@@ -384,7 +384,7 @@ try:
               open(site11, "w"))
     codex11 = subprocess.Popen(
         [sys.executable, os.path.join(HERE, "hooks", "agenthub_wake_bridge.py"), "--as", "codex@11",
-         "--codex", fake, "--grace", str(GRACE), "--debounce", "0.3", "--poll", "0.5",
+         "--codex", fake, "--grace", str(GRACE), "--debounce", "0.3", "--poll", "0.5", "--busy-stale", "6",
          "--log", os.path.join(tmp, "codex11_bridge.log")],
         env=dict(benv, AGENTHUB_TOKEN=TOK["*@11"], AGENTHUB_SITE=site11),
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -456,6 +456,9 @@ try:
           exec_calls()[base_e:])
     hook_event(N, "UserPromptSubmit", session=TN, consume=True)
     hook_event(N, "Stop", session=TN)
+    check("a Codex session that took a request and stopped without answering is reported",
+          wait_for(lambda: any(f"#{res['posted']}" in m["body"] and "without answering" in m["body"]
+                               for m in notes11()), 20), notes11()[-1:])
 
     print("\nSessionEnd")
     C = "codex@11/cccc0003"

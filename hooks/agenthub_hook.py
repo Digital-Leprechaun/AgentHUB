@@ -11,17 +11,20 @@ messages at every point its harness gives us control:
   Stop              the agent is about to end its turn with mail waiting: block the
                     stop so it deals with the mail first
   PreToolUse        the guard: a hub call (or an agenthub_watch.py command) made as
-                    any address other than this session's own is denied, and so is
-                    any hub write from inside a subagent. Local only, no network.
+                    any address other than this session's own (or, for a subagent,
+                    <session>/<role>) is denied, and so are task changes from inside a
+                    subagent. Local only, no network.
   SessionEnd        marks the session ended on the hub
 
 Every SESSION has its own address: the family from --as plus the last 8 hex digits
 of the harness's session id, e.g. claude@desk/3f2a91c0. Mail to it reaches only that
 session, so several sessions of one agent never answer the same message.
 
-Subagents (Claude Code marks their hook events with agent_id) report to their parent
-session, and only the parent talks to the hub: a subagent's events deliver STOPs but
-never mail, and the guard lets a subagent use only the read-only hub tools.
+Subagents (Claude Code marks their hook events with agent_id): a helper that never
+uses the hub needs nothing. One that does is a Worker for its parent session (the
+Orchestrator): it talks on the hub as <session>/<role>, every message tagged with a
+task, and never changes tasks. A subagent's events deliver STOPs but never mail; it
+reads its own with hub_inbox.
 
 A STOP in force is reported on every event, with no rate limit.
 
@@ -71,7 +74,7 @@ def session_address(family: str, session_id: str) -> str:
 CLAIM_TOKEN = re.compile(r"AgentHub claim token: ([0-9a-fA-F-]{32,40})")
 # The wake bridge puts this in the prompt that resumes a session: newer CLIs give the
 # resumed conversation a new session id, so the hub hands the old address's mail on.
-RESUMED_FROM = re.compile(r"AgentHub resumed from: ([a-z0-9]+@[a-z0-9]+/[0-9a-f]{8})")
+RESUMED_FROM = re.compile(r"AgentHub resumed from: ([A-Za-z0-9._-]+@[A-Za-z0-9._-]+/[0-9a-f]{8})")
 
 WATCH_AS = re.compile(r"agenthub_watch\.py\S*\s.*?--as[=\s]+[\"']?([^\s\"']+)")
 
@@ -107,7 +110,7 @@ def guard(event: dict, me: str) -> str | None:
                     f"Tell it what you need (a task change, or another Worker).")
         if hub_tool in WORKER_TOOLS:
             claimed = str(inp.get("as") or "").strip().lower()
-            if not claimed.startswith(me + "/"):
+            if not claimed.startswith(me + "/") or claimed.split("/")[-1] == "bridge":
                 return (f"As a Worker for {me}, use your own address {me}/<role> as `as` (for "
                         f"example {me}/{(event.get('agent_type') or 'worker').lower()}), and tag "
                         "every message with your subtask's task_id.")
@@ -127,7 +130,9 @@ def guard(event: dict, me: str) -> str | None:
         m = WATCH_AS.search(cmd) if isinstance(cmd, str) and "agenthub_watch" in cmd else None
         claimed = m.group(1) if m else ""
     c = claimed.lower()
-    if not c or c == me or (c.startswith(me + "/") and tool.startswith("mcp__agenthub")):
+    # <session>/bridge is reserved: only exactly vendor@host/bridge is a wake bridge.
+    if not c or c == me or (c.startswith(me + "/") and tool.startswith("mcp__agenthub")
+                            and c.split("/")[-1] != "bridge"):
         return None
     return (f"You are AgentHub session {me}. This call uses {claimed!r}, which is not you. "
             f"Use {me} (or {me}/<role> for a subagent) as `as` on hub calls and as --as for "
@@ -362,10 +367,8 @@ def main() -> None:
         nudge = title_nudge(me, title)
         text = "\n".join(t for t in (text, nudge) if t)
     if name == "SessionStart" and me != family:
-        family_mail = ("Mail to the family address starts a new session instead."
-                       if family.startswith("claude@") else
-                       "Mail to the family address goes to the family's most recently active "
-                       "session, which may be this one; treat it as yours when it is delivered here.")
+        family_mail = ("Mail to the family address reaches this session only when it belongs to "
+                       "your conversation; otherwise it starts a new session.")
         watch = f", and start your watch with --as {me}" if family.startswith("claude@") else ""
         ident = (f"[AgentHub] Your AgentHub address for this session is {me}. Use it as `as` on "
                  f"every hub call{watch}. Mail to it reaches only this session: answer only mail "

@@ -182,6 +182,17 @@ def humans() -> list[str]:
     return [h.strip().lower() for h in listed if h.strip()] or ["human@hub"]
 
 
+def native(path: str | None) -> str | None:
+    """`path` if it is a real executable. On Windows a .cmd/.bat shim runs through
+    cmd.exe, whose parsing ignores Python's argument quoting, so text from a message
+    could run commands: discovery never returns one (see argv() for an explicit one)."""
+    if not path:
+        return None
+    if os.name == "nt" and os.path.splitext(path)[1].lower() in (".cmd", ".bat"):
+        return None
+    return path
+
+
 def find_codex(explicit: str | None) -> str | None:
     """Resolved on every wake: the desktop app's codex.exe lives in a folder whose name
     changes with each update."""
@@ -192,24 +203,37 @@ def find_codex(explicit: str | None) -> str | None:
         hits = glob.glob(os.path.join(local, "OpenAI", "Codex", "bin", "*", "codex.exe"))
         if hits:
             return max(hits, key=os.path.getmtime)
-    return shutil.which("codex")
+    return native(shutil.which("codex"))
 
 
 def find_claude(explicit: str | None) -> str | None:
     if explicit:
         return explicit
-    hit = shutil.which("claude")
+    hit = native(shutil.which("claude"))
     if hit:
         return hit
     # A bridge run as a service (systemd, a scheduled task) does not get the login
     # shell's PATH, which is where ~/.local/bin usually comes from.
     for cand in (os.path.join(HOME, ".local", "bin", "claude.exe"),
                  os.path.join(HOME, ".local", "bin", "claude"),
-                 os.path.join(HOME, ".claude", "local", "claude"),
-                 os.path.join(os.environ.get("APPDATA", ""), "npm", "claude.cmd")):
+                 os.path.join(HOME, ".claude", "local", "claude")):
         if cand and os.path.exists(cand):
             return cand
     return None
+
+
+BATCH_UNSAFE = re.compile(r'["%\r\n]')
+
+
+def argv(cmd: list[str]):
+    """What to hand to subprocess for `cmd`. A native executable gets the list as is.
+    A .cmd/.bat shim (only ever given explicitly, e.g. by the tests) gets a command line
+    built here: every argument double-quoted, with the characters that can end a quoted
+    string or expand inside one (`"`, `%`, newlines) replaced, because cmd.exe parses
+    the line itself and Python's quoting does not protect against that."""
+    if os.name != "nt" or os.path.splitext(cmd[0])[1].lower() not in (".cmd", ".bat"):
+        return cmd
+    return " ".join('"' + BATCH_UNSAFE.sub("'", str(c)) + '"' for c in cmd)
 
 
 def claude_sessions(claude: str) -> list[dict] | None:
@@ -217,7 +241,7 @@ def claude_sessions(claude: str) -> list[dict] | None:
     the list could not be read."""
     try:
         flags = {"creationflags": 0x08000000} if os.name == "nt" else {}
-        r = subprocess.run([claude, "agents", "--json"], stdin=subprocess.DEVNULL,
+        r = subprocess.run(argv([claude, "agents", "--json"]), stdin=subprocess.DEVNULL,
                            capture_output=True, text=True, timeout=60, **flags)
         if r.returncode != 0:
             return None
@@ -256,9 +280,10 @@ def name_gate(text: str, host: str, cwd: str) -> str:
 
 
 def is_delivery_notice(frm: str) -> bool:
-    """Mail from a wake bridge or from the hub itself (server.py has the twin)."""
+    """Mail from a wake bridge (exactly vendor@host/bridge) or from the hub itself
+    (server.py has the twin)."""
     f = (frm or "").lower()
-    return f == "agenthub@hub" or f.endswith("/bridge")
+    return f == "agenthub@hub" or (f.count("/") == 1 and f.endswith("/bridge"))
 
 
 def parse_ts(s: str | None) -> float:
@@ -316,8 +341,9 @@ class Hub:
         return self.post("/api/claim", {"as": self.bridge_addr, "msg_id": msg_id, "target": target,
                                         "session": session_id, "cwd": cwd})["session"]
 
-    def fail(self, msg_id: int, note: str) -> None:
-        self.post("/api/request/fail", {"as": self.bridge_addr, "msg_id": msg_id, "note": note})
+    def fail(self, msg_id: int, note: str, target: str = "") -> None:
+        self.post("/api/request/fail", {"as": self.bridge_addr, "msg_id": msg_id, "note": note,
+                                        "target": target})
 
     def session_dead(self, session: str, note: str) -> list[dict]:
         """End a session that no longer exists; the hub hands its mail on."""
@@ -469,7 +495,7 @@ class Bridge:
         for addr, agent, mail, stopped in targets:
             if mail:
                 self.check_one(addr, agent, mail, stopped, now)
-            elif self.vendor == "claude" and agent.get("owes_reply"):
+            elif agent.get("owes_reply"):
                 self.check_answered(addr, agent, now)
 
         for e in state.get("escalations") or []:
@@ -756,7 +782,7 @@ class Bridge:
         # help: it has no network credentials), so the prompt tells the thread to read
         # the shared Agents folder outside the sandbox (see codex_note).
         cmd = [codex, *win, "exec", "--skip-git-repo-check", *self.a.codex_args, "-C", cwd] + args
-        p = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=log, stderr=log, **flags)
+        p = subprocess.Popen(argv(cmd), cwd=cwd, stdin=subprocess.DEVNULL, stdout=log, stderr=log, **flags)
         log.close()
         self.procs[key] = p
         return p
@@ -833,6 +859,25 @@ class Bridge:
             self.log(f"the {self.vendor} CLI on {self.host} is signed in again")
         return ok
 
+    def stop_claude(self, entry: dict, session: str) -> bool:
+        """Stop a background Claude session and confirm it is gone. Resuming, replacing
+        or elevating a session that is still running would leave two copies working."""
+        claude = find_claude(self.a.claude)
+        try:
+            r = self.run([claude, "stop", entry.get("id") or session[:8]])
+        except Exception as e:  # noqa: BLE001
+            self.log(f"could not stop {entry.get('id')}: {e}")
+            return False
+        live = claude_sessions(claude)
+        still = live is None or any((x.get("sessionId") or "").lower() == session.lower()
+                                    and (x.get("status") or "").lower() in ("busy", "running", "idle")
+                                    for x in live)
+        if r.returncode != 0 and still:
+            self.log(f"`claude stop {entry.get('id')}` exited {r.returncode} and the session is still "
+                     f"running: {(r.stdout + r.stderr).strip()[:200]}")
+            return False
+        return True
+
     def resume(self, addr: str, session: str, entry: dict | None, mail: list[dict], agent: dict,
                now: float) -> None:
         """Deliver to a terminal session by resuming it with the wake as its next prompt.
@@ -845,9 +890,12 @@ class Bridge:
                 f"your own session address (the one the AgentHub hook gave you) and handle them. "
                 f"AgentHub resumed from: {addr}")
         cwd = agent.get("cwd") or ""
+        if entry and not self.stop_claude(entry, session):
+            self.escalate(addr, mail, [m["id"] for m in mail],
+                          f"could not be stopped to deliver to it, so its mail waits (a copy must not run "
+                          f"beside it). Stop it by hand on {self.host}: `claude stop {entry.get('id')}`")
+            return
         try:
-            if entry:
-                self.run([claude, "stop", entry.get("id") or session[:8]])
             r = self.run([claude, "--bg", "--resume", session, text], cwd=cwd)
             out = (r.stdout + r.stderr).strip()
             gate = name_gate(out, self.host, cwd)
@@ -872,11 +920,11 @@ class Bridge:
         if not self.a.spawn:
             self.escalate(addr, mail, mids, f"{why}, and this bridge does not start sessions")
             return
-        if stop_entry:
-            try:
-                self.run([find_claude(self.a.claude), "stop", stop_entry.get("id") or ""])
-            except Exception as e:  # noqa: BLE001
-                self.log(f"could not stop {stop_entry.get('id')}: {e}")
+        if stop_entry and not self.stop_claude(stop_entry, stop_entry.get("sessionId") or ""):
+            self.escalate(addr, mail, mids, f"{why}, but it could not be stopped, so no second session "
+                                            f"is started beside it. Stop it by hand on {self.host}: "
+                                            f"`claude stop {stop_entry.get('id')}`")
+            return
         try:
             reopened = self.hub.post("/api/session/respawn", {
                 "as": self.hub.bridge_addr, "session": addr, "msg_ids": mids, "note": why})["reopened"]
@@ -908,10 +956,13 @@ class Bridge:
         elif event in BUSY_EVENTS:
             how = f"looks hung (busy, no hook activity for {int(now - last)} s)"
         elif event == "Stop":
-            entry = self.agent_entry(agent.get("session_id") or "")
-            if entry is False:
-                return
-            how = "went idle" if entry else "stopped running"
+            if self.vendor == "codex":
+                how = "went idle"  # a Codex turn that ended; its thread can be resumed
+            else:
+                entry = self.agent_entry(agent.get("session_id") or "")
+                if entry is False:
+                    return
+                how = "went idle" if entry else "stopped running"
         else:
             return
         if key in self.resumed and how in ("ended", "stopped running"):
@@ -919,8 +970,10 @@ class Bridge:
         self.unanswered.add(key)
         self.escalate_to(owed.get("from") or "", owed["id"],
                          f"Wake bridge: {addr} took message #{owed['id']} from {owed.get('from')} but "
-                         f"{how} without answering it. `claude attach` on {self.host} shows what it did, "
-                         f"or send it again to start fresh.")
+                         f"{how} without answering it. "
+                         + (f"`claude attach` on {self.host} shows what it did, " if self.vendor == "claude"
+                            else f"`codex resume {agent.get('session_id')}` on {self.host} shows what it did, ")
+                         + "or send it again to start fresh.")
 
     def to_desktop(self, e: dict, sessions: list[dict]) -> None:
         """Move a session into the Claude desktop app (hub_escalate). An agent session may
@@ -957,8 +1010,10 @@ class Bridge:
                     + (f" (it is named \"{name}\")" if name else "")
                     + f", or in a terminal with `claude attach {(entry or {}).get('id') or session[:8]}`")
             else:
-                if entry:
-                    self.run([claude, "stop", entry.get("id") or session[:8]])
+                if entry and not self.stop_claude(entry, session):
+                    raise WakeRefused(f"its background session could not be stopped, and opening it "
+                                      f"in the app beside it would make a copy. Stop it by hand on "
+                                      f"{self.host}: `claude stop {entry.get('id')}`")
                 code = self.run_on_terminal([claude, "--desktop", "--resume", session],
                                             (s or {}).get("cwd") or "")
                 if code != 0:
@@ -988,14 +1043,20 @@ class Bridge:
             si = subprocess.STARTUPINFO()
             si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             si.wShowWindow = 0  # SW_HIDE
-            p = subprocess.Popen(cmd, cwd=cwd, startupinfo=si,
+            p = subprocess.Popen(argv(cmd), cwd=cwd, startupinfo=si,
                                  creationflags=subprocess.CREATE_NEW_CONSOLE)
         else:
             script = shutil.which("script")
             if not script:
-                raise WakeRefused("`script` (util-linux) is needed to give claude a terminal")
-            line = " ".join("'" + c.replace("'", "'\\''") + "'" for c in cmd)
-            p = subprocess.Popen([script, "-qec", line, "/dev/null"], cwd=cwd, stdin=subprocess.DEVNULL,
+                raise WakeRefused("`script` is needed to give claude a terminal")
+            if sys.platform == "darwin":
+                # BSD script: script [-q] file command [args...] (untested on a real Mac)
+                pty = [script, "-q", "/dev/null", *cmd]
+            else:
+                # util-linux script: the command is one shell string
+                line = " ".join("'" + c.replace("'", "'\\''") + "'" for c in cmd)
+                pty = [script, "-qec", line, "/dev/null"]
+            p = subprocess.Popen(pty, cwd=cwd, stdin=subprocess.DEVNULL,
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             return p.wait(timeout=90)
@@ -1113,7 +1174,7 @@ class Bridge:
             self.spawn_failed.add((rq["msg_id"], rq["target"]))
             why = f"is more than {STALE_MAIL // 3600} hours old, so no session was started for it"
             try:
-                self.hub.fail(rq["msg_id"], why)
+                self.hub.fail(rq["msg_id"], why, rq["target"])
             except Exception as e:  # noqa: BLE001
                 self.log(f"could not report the failure to the hub: {e}")
             self.tell_request(rq["msg_id"], rq["target"], rq.get("frm") or "", why + "; send it again if it is still needed")
@@ -1210,7 +1271,7 @@ class Bridge:
             cmd += ["--permission-mode", self.a.permission_mode]
         cmd.append(prompt)
         flags = {"creationflags": 0x08000000} if os.name == "nt" else {}  # CREATE_NO_WINDOW
-        r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+        r = subprocess.run(argv(cmd), stdin=subprocess.DEVNULL, capture_output=True, text=True,
                            timeout=120, cwd=cwd or None, **flags)
         out = (r.stdout + r.stderr).strip()
         if r.returncode != 0:
@@ -1283,7 +1344,7 @@ class Bridge:
         # stdin=DEVNULL: under pythonw (the Windows autostart) there is no console, and
         # inheriting its invalid stdin handle makes process creation fail.
         flags = {"creationflags": 0x08000000} if os.name == "nt" else {}  # CREATE_NO_WINDOW
-        return subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+        return subprocess.run(argv(cmd), stdin=subprocess.DEVNULL, capture_output=True, text=True,
                               timeout=120, cwd=os.path.normpath(cwd) if cwd and os.path.isdir(cwd) else None,
                               **flags)
 
@@ -1359,8 +1420,7 @@ def spawn_conf(a, vendor: str) -> None:
       "spawn": {"vendors": ["claude"], "max": 3, "permission_mode": "auto",
                 "cwd": {"desk": "D:/Work", "*": "~"}, "anyone": {"*": "claude"}}
 
-    vendors  whose bridges start sessions (Codex cannot yet: no way to open a new
-             desktop thread from the CLI has been verified)
+    vendors  whose bridges start sessions (Claude: `claude --bg`; Codex: `codex exec`)
     max      hub-started sessions per host still working at once
     cwd      where a new session starts, per host; default the home folder
     anyone   which vendor answers anyone@host, per host

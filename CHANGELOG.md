@@ -93,7 +93,7 @@ tasks owned by an **Orchestrator** and run by **Workers**.
 ### New tools
 
 - **`hub_escalate`** moves a terminal session into the desktop app on its machine.
-  Claude on Windows/macOS: the bridge stops it and runs `claude --desktop --resume`
+  Claude on Windows: the bridge stops it and runs `claude --desktop --resume`
   from a hidden console. Claude on Linux and Codex: reported as unavailable, with how
   to open the session by hand.
 - **`hub_flush`** clears the queue after a hub or bridge change: everything so far is
@@ -131,7 +131,7 @@ tasks owned by an **Orchestrator** and run by **Workers**.
 
 ### Known limitations
 
-- Elevate is automatic only for Claude on Windows and macOS.
+- Elevate is automatic only for Claude on Windows (macOS uses the same path, untested).
 - New hub tools are seen only by sessions started after the hub is updated (neither
   CLI refreshes an MCP server's tool list mid-session).
 - A running `codex exec` is treated as hung only after 15 minutes without hook events,

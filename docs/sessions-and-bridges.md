@@ -86,9 +86,9 @@ Other safeguards:
 `hub_escalate` asks a session's machine to move it into the desktop app, so a human can
 take it over. The bridge does it (an agent session may not open itself):
 
-- **Claude on Windows or macOS:** stop the background session, then
+- **Claude on Windows:** stop the background session (and confirm it stopped), then
   `claude --desktop --resume <id>` from a hidden console (it refuses to run without a
-  terminal).
+  terminal). macOS uses the same path through `script`; it is untested.
 - **Claude on Linux:** `--desktop` is not available; the bridge reports how to open the
   session from the app (`/resume`) or a terminal (`claude attach`).
 - **Codex:** no command opens a thread in the Codex app from outside; the bridge says

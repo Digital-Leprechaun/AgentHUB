@@ -567,6 +567,9 @@ try:
                            call("hub_say", {"as": A, "body": "from A", "to": ["codex@11"]})["posted"]})
     check("a follow-up to an ended session becomes a request for a new one",
           "new session" in json.dumps(res.get("routing")), res)
+    hook("claude@desk", "Stop", S1)  # A comes back...
+    check("a respawned session never gets the handed-on mail again",
+          "A is open in the app" not in inbox(A))
 
     print("\na hub-started session that is gone is resumed, keeping its context")
     agents()
@@ -650,6 +653,14 @@ try:
     ans = call("hub_say", {"as": F, "body": "ANSWER [9] here", "to": [sender], "reply_to": m8})["posted"]
     res = call("hub_say", {"as": sender, "body": "follow-up for E", "to": ["claude@desk"], "reply_to": m8})
     check("a follow-up to E's conversation reaches the resumed session", res.get("notified") == [F], res)
+    res = call("hub_say", {"as": sender, "body": "direct to old E", "to": [E], "task_id": _test_task()})
+    check("direct mail to the old address follows it too", res.get("notified") == [F], res)
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("hk", os.path.join(HERE, "hooks", "agenthub_hook.py"))
+    hk = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(hk)
+    check("the resume marker accepts dotted and hyphenated hosts",
+          bool(hk.RESUMED_FROM.search("AgentHub resumed from: claude@build-1.lab_x/0123abcd")))
     time.sleep(4)
     check("and nobody is told E ended without answering",
           not any(f"#{m8}" in m["body"] and "without answering" in m["body"] for m in notes_to_sender()),
@@ -731,10 +742,31 @@ try:
     check("the Orchestrator marks the subtask elevated", r.get("task", {}).get("status") == "elevated", r)
     r = call("hub_task_create", {"as": W, "title": "now mine", "status": "active"})
     check("and the elevated session becomes an Orchestrator", "task" in r, r)
+    r = call("hub_task_create", {"as": O + "/bridge", "title": "sneaky"})
+    check("<session>/bridge gets no bridge rights (it is a Worker subagent)", "_error" in r, r)
+    d = hook("claude@desk", "PreToolUse", S4, {"tool_name": "mcp__agenthub__hub_say",
+                                               "tool_input": {"as": D + "/bridge", "body": "x"}})
+    check("and the hook will not let a session act as <session>/bridge",
+          (d.get("hookSpecificOutput") or {}).get("permissionDecision") == "deny", d)
     r = call("hub_task_update", {"as": O, "id": P, "status": "elevated"})
     check("a primary task cannot be marked elevated", "_error" in r, r)
 
     print("\nhub_flush clears the queue without deleting anything")
+    agents()
+    n = len(claude_calls())
+    rq = call("hub_say", {"as": sender, "body": "late adoption", "to": ["claude@desk"]})["posted"]
+    wait_for(lambda: any(f"AgentHub request #{rq} " in c[-1] for c in calls_since(n)), 10)
+    sp = next((c for c in calls_since(n) if f"AgentHub request #{rq} " in c[-1]), [""])
+    S9, G9 = "99999999-9999-4999-8999-9999aaaa0019", "claude@desk/aaaa0019"
+    hook("claude@desk", "SessionStart", S9)
+    call("hub_say", {"as": sender, "body": "later direct mail", "to": [G9]})
+    inbox(G9)  # the session reads the later mail first: its cursor moves past the request
+    got = hook_text(hook("claude@desk", "UserPromptSubmit", S9, {"prompt": sp[-1]}))
+    check("a request adopted after later mail was read is still delivered", "late adoption" in got, got)
+    code, body = post("/api/request/fail", {"as": "claude@desk/bridge", "msg_id": rq, "note": "x",
+                                            "target": "claude@desk"}, TOK["*@desk"])
+    check("a bridge can close a request it will not take", code == 200, (code, body))
+
     m6 = call("hub_say", {"as": sender, "body": "HANDOFF [9] backlog item", "to": [B]})["posted"]
     m7 = call("hub_say", {"as": sender, "body": "backlog request", "to": ["claude@desk"]})["posted"]
     refused = call("hub_flush", {"as": "codex@11", "reason": "test"})

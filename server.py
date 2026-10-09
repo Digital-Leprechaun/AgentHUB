@@ -97,7 +97,7 @@ def sid_of(session_id: str | None) -> str:
 def is_delivery_notice(frm: str) -> bool:
     """Mail from a wake bridge or from the hub itself: a report about delivering mail."""
     f = (frm or "").lower()
-    return f == HUB_SENDER or f.endswith("/bridge")
+    return f == HUB_SENDER or (f.count("/") == 1 and f.endswith("/bridge"))
 
 
 def now_iso() -> str:
@@ -200,6 +200,14 @@ CREATE TABLE IF NOT EXISTS agents(
 
 -- A session resumed under a new session id (newer Claude CLIs give a resumed
 -- conversation a fresh id): mail for the old address follows it to the new one.
+-- Mail handed from one session to another (a respawn, or a resume under a new id):
+-- the old session is never notified of it again, even if it comes back.
+CREATE TABLE IF NOT EXISTS transfers(
+  msg_id   INTEGER NOT NULL,
+  frm_addr TEXT    NOT NULL,
+  PRIMARY KEY(msg_id, frm_addr)
+);
+
 CREATE TABLE IF NOT EXISTS successors(
   old TEXT PRIMARY KEY,
   new TEXT NOT NULL,
@@ -356,6 +364,14 @@ class Store:
             if col not in acols:
                 self.db.execute(f"ALTER TABLE agents ADD COLUMN {col} TEXT")
                 log(f"migrated: agents.{col} added")
+        rcols = {r[1] for r in self.db.execute("PRAGMA table_info(requests)")}
+        if "delivered" not in rcols:
+            # A request is delivered to the session that holds it whatever that session's
+            # read cursor says (it may have been adopted after later mail was read).
+            # Requests that exist already have been delivered under the old rules.
+            self.db.execute("ALTER TABLE requests ADD COLUMN delivered INTEGER NOT NULL DEFAULT 0")
+            self.db.execute("UPDATE requests SET delivered=1")
+            log("migrated: requests.delivered added")
         tcols = {r[1] for r in self.db.execute("PRAGMA table_info(tasks)")}
         if "worker" not in tcols:
             # Who is running a subtask (a Worker session, a hub-using subagent, or a
@@ -680,8 +696,9 @@ class Store:
         kind = self.kind_of(address)
         subs = "topic IN (SELECT topic FROM subs WHERE address = :me)"
         if kind == "session":
-            return ("(recips LIKE :exact OR " + subs + " OR body LIKE :mention"
-                    " OR id IN (SELECT msg_id FROM requests WHERE claimed_by = :me AND state IN ('claimed','assigned')))")
+            return ("((recips LIKE :exact OR " + subs + " OR body LIKE :mention"
+                    " OR id IN (SELECT msg_id FROM requests WHERE claimed_by = :me AND state IN ('claimed','assigned')))"
+                    " AND id NOT IN (SELECT msg_id FROM transfers WHERE frm_addr = :me))")
         if kind in ("anyone", "bridge"):
             return "(recips LIKE :exact)"
         parts = ["(recips = '[]' AND topic = '')"]           # broadcast on the default topic
@@ -713,6 +730,8 @@ class Store:
             return False
         subscribed = bool(topic) and topic in self.subs_of(address)
         if kind == "session":
+            if self.one("SELECT 1 FROM transfers WHERE msg_id=? AND frm_addr=?", (msg["id"], a)):
+                return False  # handed to another session
             if a in recips or subscribed or mentioned:
                 return True
             return bool(self.one("SELECT 1 FROM requests WHERE msg_id=? AND claimed_by=? AND state IN ('claimed','assigned')",
@@ -763,13 +782,19 @@ class Store:
         args = self._target_args(a)
         args["last"] = last
         args["lim"] = limit
-        sql = (f"SELECT * FROM messages WHERE id > :last AND frm != :me AND archived=0 "
-               f"AND {self.targeted_at(address)} ORDER BY id LIMIT :lim")
+        held = ("id IN (SELECT msg_id FROM requests WHERE claimed_by = :me"
+                " AND state IN ('claimed','assigned') AND delivered = 0)")
+        sql = (f"SELECT * FROM messages WHERE frm != :me AND archived=0 "
+               f"AND ((id > :last AND {self.targeted_at(address)}) OR {held}) ORDER BY id LIMIT :lim")
         with self.lock:
             rows = self.db.execute(sql, args).fetchall()
         msgs = [self._row_to_msg(r) for r in rows]
         if mark and msgs:
             self.set_cursor(address, msgs[-1]["id"])
+            with self.lock:
+                self.db.executemany("UPDATE requests SET delivered=1 WHERE claimed_by=? AND msg_id=?",
+                                    [(address.lower(), m["id"]) for m in msgs])
+                self.db.commit()
         return msgs
 
     def set_cursor(self, address: str, mid: int) -> None:
@@ -1028,7 +1053,7 @@ class Store:
         session = f"{bridge.family}/{sid}"
         with self.lock:
             cur = self.db.execute(
-                "UPDATE requests SET state='claimed', claimed_by=?, claimed_at=?"
+                "UPDATE requests SET state='claimed', claimed_by=?, claimed_at=?, delivered=0"
                 " WHERE msg_id=? AND target=? AND state IN ('open','unclaimed')",
                 (session, now_iso(), int(msg_id), target))
             self.db.commit()
@@ -1056,8 +1081,8 @@ class Store:
                                   " AND state='starting'", (placeholder,)).fetchone()
             if not row:
                 return 0
-            cur = self.db.execute("UPDATE requests SET claimed_by=? WHERE claimed_by=? AND state='claimed'",
-                                  (me, placeholder))
+            cur = self.db.execute("UPDATE requests SET claimed_by=?, delivered=0 WHERE claimed_by=?"
+                                  " AND state='claimed'", (me, placeholder))
             self.db.execute("UPDATE agents SET spawned_for=? WHERE address=?", (row["spawned_for"], me))
             self.db.execute("UPDATE agents SET state='ended' WHERE address=?", (placeholder,))
             self.db.commit()
@@ -1069,8 +1094,16 @@ class Store:
         self._bump()
         return n
 
-    def request_fail(self, bridge: Addr, msg_id: int, note: str) -> None:
-        """A bridge could not start the session it claimed for: mark both failed/ended."""
+    def request_fail(self, bridge: Addr, msg_id: int, note: str, target: str = "") -> None:
+        """A bridge could not start the session it claimed for: mark both failed/ended.
+        With `target`, an open request it will not take (too old) is closed as well, if
+        the target is its family or its host's anyone@."""
+        target = (target or "").lower()
+        if target in (bridge.family, f"anyone@{bridge.host}"):
+            with self.lock:
+                self.db.execute("UPDATE requests SET state='failed', note=? WHERE msg_id=? AND target=?"
+                                " AND state IN ('open','unclaimed')", ((note or "")[:500], int(msg_id), target))
+                self.db.commit()
         with self.lock:
             rows = self.db.execute(
                 "SELECT claimed_by FROM requests WHERE msg_id=? AND state='claimed'"
@@ -1139,9 +1172,10 @@ class Store:
                                    " (state='open' OR (claimed_by IS NOT NULL AND claimed_by != ?))",
                                    (mid, family, address)).fetchone():
                     continue
+                self.db.execute("INSERT OR IGNORE INTO transfers(msg_id,frm_addr) VALUES(?,?)", (mid, address))
                 cur = self.db.execute(
                     "UPDATE requests SET state='open', claimed_by=NULL, claimed_at=NULL, escalated=0,"
-                    " created=?, note=? WHERE msg_id=? AND target=?", (ts, why, mid, family))
+                    " delivered=0, created=?, note=? WHERE msg_id=? AND target=?", (ts, why, mid, family))
                 if cur.rowcount == 0:
                     self.db.execute(
                         "INSERT INTO requests(msg_id,target,state,created,note) VALUES(?,?,'open',?,?)",
@@ -1170,12 +1204,16 @@ class Store:
                 "SELECT id FROM messages WHERE id > ? AND recips LIKE ?", (last, f'%"{old}"%'))]
             for mid in mids:
                 self.db.execute(
-                    "INSERT INTO requests(msg_id,target,state,created,claimed_by,claimed_at,note)"
-                    " VALUES(?,?,'assigned',?,?,?,?) ON CONFLICT(msg_id,target) DO UPDATE SET"
-                    " state='assigned', claimed_by=excluded.claimed_by, claimed_at=excluded.claimed_at",
-                    (mid, old, ts, me, ts, f"resumed from {old}"))
-            self.db.execute("UPDATE requests SET claimed_by=? WHERE claimed_by=? AND state IN ('claimed','assigned')",
-                            (me, old))
+                    "INSERT INTO requests(msg_id,target,state,created,claimed_by,claimed_at,note,delivered)"
+                    " VALUES(?,?,'assigned',?,?,?,?,0) ON CONFLICT(msg_id,target) DO UPDATE SET"
+                    " state='assigned', claimed_by=excluded.claimed_by, claimed_at=excluded.claimed_at,"
+                    " delivered=0", (mid, old, ts, me, ts, f"resumed from {old}"))
+                self.db.execute("INSERT OR IGNORE INTO transfers(msg_id,frm_addr) VALUES(?,?)", (mid, old))
+            for (mid,) in self.db.execute("SELECT msg_id FROM requests WHERE claimed_by=? AND state IN"
+                                          " ('claimed','assigned')", (old,)).fetchall():
+                self.db.execute("INSERT OR IGNORE INTO transfers(msg_id,frm_addr) VALUES(?,?)", (mid, old))
+            self.db.execute("UPDATE requests SET claimed_by=?, delivered=0 WHERE claimed_by=? AND state IN"
+                            " ('claimed','assigned')", (me, old))
             wo = self.db.execute("SELECT worker_of FROM agents WHERE address=?", (old,)).fetchone()
             if wo and wo[0]:
                 self.db.execute("UPDATE agents SET worker_of=? WHERE address=?", (wo[0], me))
@@ -1192,6 +1230,16 @@ class Store:
         log(f"{me} resumed {old}; moved message(s) {', '.join('#' + str(m) for m in mids) or 'none'}")
         self._bump()
         return len(mids)
+
+    def follow(self, address: str) -> str:
+        """`address` (a session, or a subagent of one), moved on to the session its
+        conversation was resumed as, if it was."""
+        a = (address or "").lower()
+        base = self.session_base(a)
+        if not base:
+            return a
+        new = self.successor(base)
+        return a if new == base else new + a[len(base):]
 
     def successor(self, address: str) -> str:
         """The live session a resumed conversation now runs as (itself if none)."""
@@ -1273,8 +1321,8 @@ class Store:
         fam = a.split("/")[0]
         if fam in HUMANS:
             return "human", None
-        if a == HUB_SENDER or a.endswith("/bridge"):
-            return "system", None
+        if a == HUB_SENDER or (a.count("/") == 1 and a.endswith("/bridge")):
+            return "system", None  # exactly vendor@host/bridge: never a session's child
         if a.count("/") >= 2:
             r = self.one("SELECT id FROM tasks WHERE worker=? AND status NOT IN ('done','elevated')"
                          " ORDER BY id DESC LIMIT 1", (a,))
@@ -1931,13 +1979,19 @@ class Hub:
                 reqs.append({"target": r, "state": state})
                 notes.append(f"{r}: " + ("a bridge on that host will start a new session" if state == "open"
                                          else f"no bridge on {a.host} can start a session; the humans are told"))
-            elif kind in ("human", "session", "bridge"):
+            elif kind == "session":
+                f = st.follow(r)
+                if f != r:
+                    notes.append(f"{raw} -> {f} (its conversation was resumed as {f.split('/')[0]}/"
+                                 f"{f.split('/')[1]})")
+                    r = f
+            elif kind in ("human", "bridge"):
                 pass
             elif a.role:
                 seg, _, rest = a.role.lower().partition("/")
                 hit = st.by_label(a.family, seg)
                 if hit:
-                    r = hit + (f"/{rest}" if rest else "")
+                    r = st.follow(hit + (f"/{rest}" if rest else ""))
                     notes.append(f"{raw} -> {r} (label)")
             else:
                 base = None
@@ -2780,7 +2834,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"session": session})
             elif path == "/api/request/fail":
                 me = self.bridge_call(body)
-                STORE.request_fail(me, int(body["msg_id"]), body.get("note", ""))
+                STORE.request_fail(me, int(body["msg_id"]), body.get("note", ""), body.get("target", ""))
                 self.send_json({"ok": True})
             elif path == "/api/escalation/done":
                 me = self.bridge_call(body)

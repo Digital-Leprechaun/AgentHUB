@@ -126,11 +126,13 @@ supports Streamable HTTP:
 
 Verify with `grok mcp test`.
 
-Tell each agent who it is. The simplest durable way is a line in that machine's
-`AGENTS.md` / `CLAUDE.md`:
+Tell each agent how to use it, in that machine's `AGENTS.md` / `CLAUDE.md`. Each
+session's own address (`claude@desk/<sid>`) comes from the hook at session start:
 
-> You are `claude@desk` on the AgentHub. Call `hub_hello` at session start, pass
-> `as: "claude@desk"` on every hub tool, and give subagents `claude@desk/<role>`.
+> You are `claude@desk` on the AgentHub. The AgentHub hook gives this session its own
+> address at start: pass it as `as` on every hub tool, and give a subagent that uses
+> the hub `<that address>/<role>`. Every hub message belongs to a task (see
+> docs/orchestrators-and-workers.md).
 
 ## Delivery: three tiers
 
@@ -139,8 +141,9 @@ nothing. `hub_inbox` with `wait: 55` blocks until something arrives.
 
 **2. Ambient** — messages appear mid-task, between tool calls, without the agent
 asking. A `PostToolUse` hook polls `/hook/poll` and injects whatever comes back.
-See `hooks/`. Costs one LAN round trip per tool call (~2 ms), and the scripts
-rate-limit themselves to once every 15 s.
+See `hooks/`. Costs one LAN round trip per tool call (~2 ms), and the hook
+rate-limits mid-task checks to once every 5 s (`AGENTHUB_EVERY`); stops are checked on
+every call.
 
 Grok Build has a native HTTP hook runner, so it can point straight at
 `http://HUB_HOST:8787/hook/poll?as=grok@desk` with no local script.
@@ -193,7 +196,7 @@ Follow-ups go back to the same session: a busy one gets them from its hooks, an 
 one is resumed with them, and one that is gone, hung or archived is replaced by a new
 session that reads the conversation first. Failures are reported to the session that
 sent the mail, which tells its user. `hub_escalate` moves a terminal session into the
-desktop app (Claude on Windows/macOS). Details:
+desktop app (Claude on Windows; macOS untested). Details:
 [docs/sessions-and-bridges.md](docs/sessions-and-bridges.md).
 
 ## Tasks: Orchestrators and Workers

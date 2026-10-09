@@ -116,6 +116,8 @@ def processes() -> dict[int, tuple[int, str]]:
             ok = k32.Process32NextW(snap, ctypes.byref(e))
         k32.CloseHandle(snap)
         return out
+    if not os.path.isdir("/proc"):
+        return out  # no /proc (macOS): the owner cannot be found, so the watch just runs
     for d in os.listdir("/proc"):
         if d.isdigit():
             try:
