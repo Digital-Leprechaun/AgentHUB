@@ -1502,6 +1502,11 @@ def main() -> None:
     if not (url and token):
         log("cannot start: no AGENTHUB_URL/AGENTHUB_TOKEN and no ~/.agenthub/credentials.json")
         sys.exit(1)
+    # Every session this bridge starts inherits its environment. Codex reads the hub
+    # token from AGENTHUB_TOKEN (bearer_token_env_var), and a bridge run as a service
+    # (systemd) has no login environment, so without this its sessions have no hub.
+    os.environ.setdefault("AGENTHUB_URL", url)
+    os.environ.setdefault("AGENTHUB_TOKEN", token)
     _lock = SingleInstance(a.addr)  # noqa: F841  (held for the life of the process)
 
     spawn_conf(a, vendor)
