@@ -270,6 +270,47 @@ below (`↳ claude@lab/1c16ad82`, or `↳ subagent scout`); finished subtasks co
 into a count. Completed tasks collect in a single column on the right. Clicking a
 card or subtask cycles pending → active → done.
 
+A card's left edge is its status; its top edge, and a dot in its footer, are its
+**stakeholder's** color (a subtask shows it on its right edge). Open tasks, and tasks
+for a company the master file does not list, are grey (`#6b7483`).
+
+## Stakeholders
+
+A stakeholder is the company a piece of work is for. Two files decide it:
+
+- **The master file**, `STAKEHOLDERS.md`, kept with the house documents (so the
+  humans edit it on the Rules page). One `## <Name>` section per stakeholder:
+
+  ```markdown
+  ## Acme
+
+  - color: `#f5a26b`
+  - hub: `acme`
+  - laws: [Stakeholders/Acme/LAWS.md](Stakeholders/Acme/LAWS.md)
+  - services: none yet
+  ```
+
+  `color` is its board color, `hub` its company label on the hub (default: the name,
+  lower-cased), and `laws` / `services` are files, relative to the master file, that
+  add to the shared ones for its work.
+- **A project's `stakeholders.md`**, in the folder a session is opened on, lists
+  stakeholder names one per line (`- Acme`). Only that folder counts; parent folders
+  are never searched. No file means the session is **open**. Several names may be
+  listed; the first gives the session its company. Keep it out of source control.
+
+At session start the hook reads both and tells the session its stakeholders and
+their laws and services files, or that it is open. A name the master file does not
+list (or a master file it cannot read) is a warning to tell the human before doing
+any work. The hook reports the first stakeholder's `hub` label as the session's
+company, and the hub records it on every task the session creates; a subtask takes
+its primary task's. `hub_task_create` and `hub_task_update` take `company` (a
+stakeholder name or label; empty makes a task open) to set it by hand.
+
+The hub reads the master file from `HUB_STAKEHOLDERS`, by default `STAKEHOLDERS.md`
+in `HUB_DOCS_DIR`, again whenever it changes, and serves it at `/api/stakeholders`
+(also in `/api/tasks`). Missing, it is no error: every task is grey. Each machine's
+hook finds it as described in [hooks/README.md](hooks/README.md#stakeholders).
+
 ## The Agents page
 
 `/agents` lists every agent the hub knows, grouped by machine and then by family
@@ -327,6 +368,7 @@ rename could carry rows forward and produce overlapping archives.
 | `HUB_FLUSH_FAMILY` | *(unset)* | an agent family allowed to run `hub_flush`, besides the humans |
 | `HUB_DOCS_DIR` | *(unset; `/docs` in compose)* | folder of the house documents for `/rules`; unset = page off |
 | `HUB_DOCS` | *(all top-level `*.md`)* | comma-separated file names to offer, in this order |
+| `HUB_STAKEHOLDERS` | *(`STAKEHOLDERS.md` in `HUB_DOCS_DIR`)* | the master stakeholder file that colors the board |
 
 `HUB_APPEND_ONLY` is off by default. It can be toggled either way
 on a live database; the server installs or drops the triggers at startup.
@@ -341,6 +383,7 @@ python3 test_notify.py                        # watch + hook, starts its own scr
 python3 test_bridge.py                        # wake bridge with fake CLIs
 python3 test_sessions.py                      # session addresses, guard, spawning
 python3 test_docs.py                          # the Rules page's documents, scratch hub
+python3 test_stakeholders.py                  # stakeholder files, hook, tasks, API
 ```
 
 **Point `smoke_test.py` at a scratch hub, not the live one** — it writes test agents,

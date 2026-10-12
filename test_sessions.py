@@ -83,7 +83,8 @@ def hook(addr_family, event, session, payload_extra=None, companies=""):
     """Run the real agenthub_hook.py as the harness would; returns its stdout JSON or {}."""
     env = dict(os.environ, AGENTHUB_URL=BASE, AGENTHUB_TOKEN=tok_for(addr_family),
                AGENTHUB_EVERY="0", TMPDIR=tmp, TEMP=tmp, TMP=tmp,
-               AGENTHUB_COMPANIES=companies or os.path.join(tmp, "no-companies.json"))
+               AGENTHUB_COMPANIES=companies or os.path.join(tmp, "no-companies.json"),
+               AGENTHUB_STAKEHOLDERS=master)
     env.pop("CODEX_THREAD_ID", None)
     payload = {"hook_event_name": event, "session_id": session, "cwd": tmp}
     payload.update(payload_extra or {})
@@ -190,6 +191,13 @@ companies_desk = os.path.join(tmp, "companies-desk.json")
 json.dump({"acme": [acme_desk], "ghost": [os.path.join(tmp, "missing")]}, open(companies_desk, "w"))
 companies_11 = os.path.join(tmp, "companies-11.json")
 json.dump({"Acme": acme_11}, open(companies_11, "w"))
+# The sending session's company is its stakeholder: acme_11/deep binds Acme Corp, whose
+# hub label (in the master file) is acme.
+master = os.path.join(tmp, "STAKEHOLDERS.md")
+with open(master, "w", encoding="utf-8") as fh:
+    fh.write("# STAKEHOLDERS\n\n## Acme Corp\n\n- color: `#f5a26b`\n- hub: `acme`\n")
+with open(os.path.join(acme_11, "deep", "stakeholders.md"), "w", encoding="utf-8") as fh:
+    fh.write("- Acme Corp\n")
 
 
 def claude_calls():
@@ -473,7 +481,7 @@ try:
          companies=companies_11)
     sender = "claude@11/0000c0de"
     me_row = [w for w in call("hub_who", {})["agents"] if w["address"] == sender]
-    check("the hook registers the session's company from its folder",
+    check("the hook registers the session's company from its folder's stakeholders.md",
           me_row and me_row[0].get("company") == "acme", me_row)
 
     def spawn_by(args, secs=8):

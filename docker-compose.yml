@@ -28,3 +28,5 @@ services:
       # Folder of house documents for /rules, and which files in it to offer (blank: all *.md).
       HUB_DOCS_DIR: "/docs"
       HUB_DOCS: "${HUB_DOCS:-}"
+      # The master stakeholder file that colors the board (blank: STAKEHOLDERS.md in /docs).
+      HUB_STAKEHOLDERS: "${HUB_STAKEHOLDERS:-}"

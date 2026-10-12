@@ -22,7 +22,7 @@
   <input id="nowner" placeholder="owner (claude@desk)" autocomplete="off" style="width:200px">
   <button id="add">add task</button>
   <span class="hint">Columns are agent families (vendor@host). A task's subtasks sit inside its card,
-    each with the Worker running it (↳). Click a card or subtask to move it forward; shift-click a
+    each with the Worker running it (↳). A card's top edge is its stakeholder's color (grey: open). Click a card or subtask to move it forward; shift-click a
     completed one to reopen it.</span>
 </section>
 
@@ -36,6 +36,19 @@ const CLOSED = s => s === 'done' || s === 'elevated';
 let KIDS = new Map();  // primary task id -> its subtasks
 const PLANNING_LIMIT = 3;  // HUB_PLANNING_TURNS
 
+// Stakeholders (the companies work is for), from the hub's master file: company label
+// -> {name, color}. A task with no stakeholder, or one the file does not list, is open
+// and shows in the open grey. The color marks the card's top edge (and a subtask's right
+// edge): the left edge belongs to the task's status.
+let STAKE = new Map(), OPEN_COLOR = '#6b7483';
+function stake(t){
+  const s = t.company && STAKE.get(t.company);
+  if (s) return { name: s.name, color: s.color };
+  return { name: t.company ? t.company + ' (not in the stakeholder file)' : 'open', color: OPEN_COLOR,
+           label: t.company || 'open' };
+}
+const shStyle = s => ' style="--sh:' + escapeHtml(s.color) + '"';
+
 // Families whose agent list is unfolded. Folded by default; remembered in this browser
 // so a repaint (every 15s, or on any task or message) keeps what the viewer opened.
 const OPEN_FAMS = new Set((() => {
@@ -48,7 +61,9 @@ function sub(t){
   const w = t.worker || '';
   const who = !w ? 'unassigned'
     : w.startsWith((t.owner || '') + '/') ? 'subagent ' + w.slice(t.owner.length + 1) : w;
-  return '<div class="sub ' + t.status + '" data-id="' + t.id + '">' +
+  const s = stake(t);
+  return '<div class="sub ' + t.status + '" data-id="' + t.id + '"' + shStyle(s) +
+    ' title="stakeholder: ' + escapeHtml(s.name) + '">' +
     '<div class="sl"><span class="badge ' + t.status + '">' + t.status + '</span>' +
     '<span class="st" title="' + escapeHtml(t.title) + '">' + escapeHtml(t.title) + '</span></div>' +
     '<div class="sm"><span class="sw" title="' + escapeHtml(w) + '">↳ ' + escapeHtml(who) + '</span>' +
@@ -71,11 +86,13 @@ function card(t){
     ? '<span class="badge ' + (t.planning_turns > PLANNING_LIMIT ? 'over' : 'planning') +
       '" title="planning exchanges">' + t.planning_turns + '/' + PLANNING_LIMIT + '</span>'
     : '';
-  return '<div class="card ' + t.status + '" data-id="' + t.id + '">' +
+  const s = stake(t);
+  return '<div class="card ' + t.status + '" data-id="' + t.id + '"' + shStyle(s) + '>' +
     '<div class="t">' + escapeHtml(t.title) + '</div>' +
     (t.body ? '<div class="b">' + escapeHtml(t.body) + '</div>' : '') +
     '<div class="f"><span class="badge ' + t.status + '">' + t.status + '</span>' + turns +
     (t.topic ? '<span class="topic">#' + escapeHtml(t.topic) + '</span>' : '') +
+    '<span class="sh" title="stakeholder: ' + escapeHtml(s.name) + '">' + escapeHtml(s.label || s.name) + '</span>' +
     '<span title="task id · messages">#' + t.id + (t.messages ? ' · ' + t.messages + ' msg' : '') + '</span>' +
     '<span class="owner">' + escapeHtml(t.owner) + '</span></div>' + subs(t) + '</div>';
 }
@@ -83,7 +100,10 @@ function card(t){
 async function paint(){
   let tasks = [], agents = [];
   try {
-    tasks = (await api('/api/tasks')).tasks || [];
+    const r = await api('/api/tasks');
+    tasks = r.tasks || [];
+    STAKE = new Map((r.stakeholders || []).map(s => [s.hub, s]));
+    OPEN_COLOR = r.open_color || OPEN_COLOR;
     agents = (await api('/api/who')).agents || [];
   } catch { return; }
 

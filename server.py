@@ -67,7 +67,7 @@ MAX_BODY = 32000
 MAX_WAIT = 60
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_NAME = "agenthub"
-SERVER_VERSION = "3.1.0"
+SERVER_VERSION = "3.2.0"
 
 # A family-addressed request (claude@desk, anyone@desk) that no bridge claims within
 # this long is escalated to the humans and the sender.
@@ -84,6 +84,12 @@ FLUSH_FAMILY = os.environ.get("HUB_FLUSH_FAMILY", "").lower()
 DOCS_DIR = os.environ.get("HUB_DOCS_DIR", "")
 DOCS_ONLY = [d.strip() for d in os.environ.get("HUB_DOCS", "").split(",") if d.strip()]
 DOC_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\.md$")
+# The master stakeholder file: the companies work is for, each with its board color and
+# its company label on the hub. HUB_STAKEHOLDERS names it; by default STAKEHOLDERS.md
+# in HUB_DOCS_DIR. Missing or unreadable, every task shows in the open color.
+STAKEHOLDERS_FILE = os.environ.get("HUB_STAKEHOLDERS", "") or (
+    os.path.join(DOCS_DIR, "STAKEHOLDERS.md") if DOCS_DIR else "")
+OPEN_COLOR = "#6b7483"  # tasks with no stakeholder, or one the master file does not list
 MAX_DOC = 256 * 1024
 
 ADDR_RE = re.compile(r"^([a-z0-9][a-z0-9._-]{0,31})@([a-z0-9][a-z0-9._-]{0,31})(?:/([a-z0-9][a-z0-9._/-]{0,63}))?$", re.I)
@@ -418,6 +424,12 @@ class Store:
             # family until a session takes it); the owner stays its Orchestrator.
             self.db.execute("ALTER TABLE tasks ADD COLUMN worker TEXT")
             log("migrated: tasks.worker added")
+        if "company" not in tcols:
+            # The stakeholder the task is for, as its company label (acme): from the
+            # creating session's stakeholders.md, or the primary task's for a subtask.
+            # NULL is an open task. The board colors tasks by it.
+            self.db.execute("ALTER TABLE tasks ADD COLUMN company TEXT")
+            log("migrated: tasks.company added")
         if "orig_to" not in cols:
             # What the sender wrote, when routing rewrote `recips` (labels, narrowing).
             self.db.execute("ALTER TABLE messages ADD COLUMN orig_to TEXT")
@@ -922,22 +934,30 @@ class Store:
             self.db.commit()
 
     def task_create(self, actor: Addr, title: str, body: str, owner: Addr,
-                    topic: str, parent_id: int | None, worker: str | None = None) -> dict:
+                    topic: str, parent_id: int | None, worker: str | None = None,
+                    company: str | None = None) -> dict:
+        """`company` is the stakeholder the task is for; None takes the primary task's
+        for a subtask, else the creating session's (its hook reports it), else the owner's."""
         title = (title or "").strip()
         if not title:
             raise HubError("task needs a title")
+        parent = None
         if parent_id is not None:
             parent = self.task(int(parent_id))
             if parent.get("parent_id") is not None:
                 raise HubError(f"task {parent_id} is itself a subtask: tasks go two levels deep. Add a "
                                f"sibling under task {parent['parent_id']} instead")
+        if company is None:
+            company = (parent.get("company") if parent else "") or (
+                "" if parent else self.company_of(str(actor)) or self.company_of(str(owner)))
         ts = now_iso()
         with self.lock:
             cur = self.db.execute(
-                "INSERT INTO tasks(title,body,owner,family,vendor,host,topic,status,parent_id,worker,created,updated)"
-                " VALUES(?,?,?,?,?,?,?,'pending',?,?,?,?)",
+                "INSERT INTO tasks(title,body,owner,family,vendor,host,topic,status,parent_id,worker,"
+                "company,created,updated) VALUES(?,?,?,?,?,?,?,'pending',?,?,?,?,?)",
                 (title, body or "", str(owner), owner.family, owner.vendor, owner.host,
-                 topic, parent_id, (worker or "").strip().lower() or None, ts, ts),
+                 topic, parent_id, (worker or "").strip().lower() or None,
+                 norm_company(company) or None, ts, ts),
             )
             self.db.commit()
             tid = cur.lastrowid
@@ -952,7 +972,7 @@ class Store:
         return dict(r)
 
     def task_update(self, actor: Addr, tid: int, **fields) -> dict:
-        allowed = {"title", "body", "owner", "status", "topic", "worker"}
+        allowed = {"title", "body", "owner", "status", "topic", "worker", "company"}
         sets, args, notes = [], [], []
         cur = self.task(tid)
         for k, v in fields.items():
@@ -964,6 +984,8 @@ class Store:
                 raise HubError("only a subtask can be marked elevated")
             if k == "worker":
                 v = (v or "").strip().lower() or None
+            if k == "company":
+                v = norm_company(v) or None  # '' makes the task open again
             if k == "owner":
                 o = Addr.parse(v)
                 sets += ["owner=?", "family=?", "vendor=?", "host=?"]
@@ -1580,6 +1602,71 @@ class Docs:
         return self._doc(name, data, os.stat(path).st_mtime)
 
 
+def parse_stakeholders(text: str) -> list[dict]:
+    """The stakeholders in a master file: each `## <Name>` section, with its bullets
+    "- color: `#f5a26b`" and "- hub: `acme`" (the company label; default: the name).
+    Must match agenthub_hook.py's parse_master, which also reads laws and services."""
+    out: list[dict] = []
+    cur: dict | None = None
+    for line in (text or "").splitlines():
+        if line.startswith("## "):
+            cur = {"name": line[3:].strip(), "color": "", "hub": ""}
+            out.append(cur)
+            continue
+        if line.startswith("# "):
+            cur = None
+            continue
+        m = re.match(r"^\s*[-*+]\s+(.*?)\s*$", line)
+        if cur is None or not m or ":" not in m.group(1):
+            continue
+        key, val = (x.strip() for x in m.group(1).split(":", 1))
+        key = key.strip("*_ ").lower()
+        if key in ("color", "hub"):
+            cur[key] = val.strip("`'\" ")
+    for s in out:
+        if not re.fullmatch(r"#[0-9a-fA-F]{3,8}", s["color"]):
+            s["color"] = OPEN_COLOR
+        s["hub"] = norm_company(s["hub"] or s["name"])
+    return [s for s in out if s["name"]]
+
+
+class Stakeholders:
+    """The master stakeholder file, parsed again only when it changes. A file that is
+    missing or cannot be read means no stakeholders, never an error."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self.lock = threading.Lock()
+        self._mtime: float | None = None
+        self._list: list[dict] = []
+
+    def all(self) -> list[dict]:
+        if not self.path:
+            return []
+        try:
+            mtime = os.stat(self.path).st_mtime
+        except OSError:
+            return []
+        with self.lock:
+            if mtime != self._mtime:
+                try:
+                    with open(self.path, encoding="utf-8-sig", errors="replace") as fh:
+                        self._list = parse_stakeholders(fh.read(MAX_DOC))
+                    self._mtime = mtime
+                except OSError:
+                    return []
+            return [dict(s) for s in self._list]
+
+    def label(self, given: str | None) -> str:
+        """A company label from what a caller wrote: a stakeholder's name (Acme Corp) or
+        its label (acme). Anything else is kept as written, normalized."""
+        want = (given or "").strip().lower()
+        for s in self.all():
+            if want in (s["name"].lower(), s["hub"]):
+                return s["hub"]
+        return norm_company(given)
+
+
 class Tokens:
     """Family tokens: {"claude@desk": "secret", ...}.
 
@@ -1846,6 +1933,12 @@ AS_PROP = {
                    "(e.g. claude@desk/3f2a91c0); a subagent appends a role "
                    "(claude@desk/3f2a91c0/reviewer). Required on every call.",
 }
+COMPANY_TASK_PROP = {
+    "type": "string",
+    "description": "The stakeholder the task is for (its name or company label). Rarely "
+                   "needed: a subtask takes its primary task's, and a primary task the "
+                   "stakeholder of your session's folder (stakeholders.md).",
+}
 
 TOOLS = [
     {
@@ -1888,7 +1981,7 @@ TOOLS = [
                         "Rarely needed: `company` normally picks the folder."},
             "company": {"type": "string", "description": "The company this mail is about "
                         "(e.g. acme, widgets). Omit it: the hub fills it in from your "
-                        "session's folder, or from the conversation you reply to. Set it only when "
+                        "session's stakeholder, or from the conversation you reply to. Set it only when "
                         "you ask about another company's work. A machine that starts a NEW session "
                         "for this mail starts it in its own folder for that company."},
             "task_id": {"type": "integer", "description": "The task this message is about. Tag every "
@@ -1967,6 +2060,7 @@ TOOLS = [
                        "a subagent address (you/<role>), or a machine's family (claude@11) when the "
                        "hub will start a session for it."},
             "status": {"type": "string", "enum": list(TASK_STATUSES)},
+            "company": COMPANY_TASK_PROP,
         }},
     },
     {
@@ -1984,6 +2078,8 @@ TOOLS = [
             "title": {"type": "string"},
             "body": {"type": "string"},
             "topic": {"type": "string"},
+            "company": dict(COMPANY_TASK_PROP, description="The stakeholder the task is for: its "
+                            "name or company label; empty makes the task open."),
         }},
     },
     {
@@ -2288,7 +2384,7 @@ class Hub:
             workdir = r["workdir"] if r else None
         # Company: as given; else the conversation's; else the sending session's, which
         # its hook derived from the session's folder on the sender's machine.
-        company = norm_company(args.get("company"))
+        company = STAKEHOLDERS.label(args.get("company"))  # a stakeholder name or label
         if not company and args.get("reply_to"):
             r = self.store.one("SELECT company FROM messages WHERE id=?", (int(args["reply_to"]),))
             company = norm_company(r["company"]) if r else ""
@@ -2393,9 +2489,11 @@ class Hub:
                 raise HubError(f"task {parent['id']} belongs to {parent['owner']}: only its "
                                "Orchestrator adds subtasks to it")
             owner = me  # a subtask's owner is its Orchestrator; `worker` says who runs it
+        company = args.get("company")
         t = self.store.task_create(me, args.get("title", ""), args.get("body", ""),
                                    owner, norm_topic(args.get("topic")),
-                                   args.get("parent_id"), args.get("worker"))
+                                   args.get("parent_id"), args.get("worker"),
+                                   None if company is None else STAKEHOLDERS.label(company))
         if args.get("status") and args["status"] != "pending":
             t = self.store.task_update(me, t["id"], status=args["status"])
         self.watchers.push("task", t)
@@ -2415,6 +2513,7 @@ class Hub:
             me, int(args["id"]), status=args.get("status"), owner=args.get("owner"),
             title=args.get("title"), body=args.get("body"), worker=args.get("worker"),
             topic=norm_topic(args["topic"]) if args.get("topic") is not None else None,
+            company=STAKEHOLDERS.label(args["company"]) if args.get("company") is not None else None,
         )
         self.watchers.push("task", t)
         out = {"task": t}
@@ -2564,6 +2663,7 @@ TOKENS: Tokens
 WAKERS = Wakers()
 WATCHERS = Watchers()
 DOCS = Docs(DOCS_DIR, DOCS_ONLY)
+STAKEHOLDERS = Stakeholders(STAKEHOLDERS_FILE)
 HUB: Hub
 
 
@@ -2976,7 +3076,10 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/stops":
                 self.send_json({"stops": STORE.stops_active(), "humans": sorted(HUMANS)})
             elif path == "/api/tasks":
-                self.send_json({"tasks": STORE.tasks(args.get("owner"), args.get("status"))})
+                self.send_json({"tasks": STORE.tasks(args.get("owner"), args.get("status")),
+                                "stakeholders": STAKEHOLDERS.all(), "open_color": OPEN_COLOR})
+            elif path == "/api/stakeholders":
+                self.send_json({"stakeholders": STAKEHOLDERS.all(), "open_color": OPEN_COLOR})
             elif path in ("/", "/index.html"):
                 self.serve_static("index.html")
             elif path in ("/board", "/board.html"):
@@ -3113,7 +3216,9 @@ def main() -> None:
     log(f"  chat   GET  http://<host>:{PORT}/")
     if DOCS.enabled:
         log(f"  rules  GET  http://<host>:{PORT}/rules  docs={DOCS_DIR}")
-    srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    if STAKEHOLDERS_FILE:
+        log(f"  stakeholders {STAKEHOLDERS_FILE} ({len(STAKEHOLDERS.all())} listed)")
+    srv =ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     srv.daemon_threads = True
     try:
         srv.serve_forever()

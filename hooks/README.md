@@ -65,7 +65,38 @@ out of source control:
 | `humans` | who the wake bridge tells when an agent cannot be woken (default `human@hub`) |
 | `hosts` | rules mapping a hostname to its hub host part: the first rule whose `pattern` matches gives its `host`, or else the pattern's first capture group. With no match, the lowercased hostname is used |
 
+| `shared_folder` | the agents' shared folder (rules, setup kit, `STAKEHOLDERS.md`); a path, or per host: `{"lab": "/mnt/agents", "*": "//fileserver/share/Agents"}` |
+| `stakeholders` | the master `STAKEHOLDERS.md` (or its folder), when it is not in `shared_folder`; a path or per host, as above |
+
 `install_bridge.py` copies `site.json` into `~/.agenthub/` alongside the bridge.
+
+## Stakeholders
+
+At session start `agenthub_hook.py` reads `stakeholders.md` in the folder the session
+was opened on (never a parent folder) and checks each name against the master
+`STAKEHOLDERS.md` (see the main [README](../README.md#stakeholders)). It tells the
+session its stakeholders and their laws and services files, or that the session is
+open, or warns it to tell the human before working when a name is unknown or the
+master file cannot be read. It remembers the answer for the rest of the session and
+reports the first stakeholder's `hub` label to the hub as the session's company.
+
+The hook finds the master file from, in order:
+
+1. `AGENTHUB_STAKEHOLDERS` — the file, or the folder holding it;
+2. `site.json` `stakeholders` — likewise;
+3. `STAKEHOLDERS.md` in `site.json` `shared_folder`.
+
+`site.json` is read from `AGENTHUB_SITE`, else `~/.agenthub/site.json`. A machine that
+mounts the shared folder somewhere else (a Linux box with it at `/mnt/agents`) needs a
+per-host entry, or `AGENTHUB_STAKEHOLDERS` in the environment the harness starts with.
+A shared folder that does not answer within two seconds is skipped and the copy last
+read on that machine is used. Hooks never fail a session over it.
+
+`companies.json` (`AGENTHUB_COMPANIES`, else `~/.agenthub/companies.json`; see
+[companies.example.json](companies.example.json)) no longer gives a session its
+company; it only tells the wake bridge which folder on this machine a new session for
+a company starts in. Put a `stakeholders.md` in each of those folders so the sessions
+started there are bound.
 
 To install just the hooks, with `AGENTHUB_URL` and `AGENTHUB_TOKEN` set (see
 [SETUP.md](../SETUP.md)):

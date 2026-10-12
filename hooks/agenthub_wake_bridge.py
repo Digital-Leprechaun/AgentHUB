@@ -115,8 +115,10 @@ def credentials() -> tuple[str, str]:
 
 
 def companies() -> dict[str, list[str]]:
-    """This machine's company -> project folders, e.g. {"acme": ["D:/Work/Acme"]}.
-    Each machine keeps its own (folders differ per machine), in $AGENTHUB_COMPANIES or
+    """This machine's company -> project folders, e.g. {"acme": ["D:/Work/Acme"]}: where
+    a new session for a request about that company starts. (A session's own company
+    comes from the stakeholders.md in its folder, read by agenthub_hook.py.) Each
+    machine keeps its own (folders differ per machine), in $AGENTHUB_COMPANIES or
     ~/.agenthub/companies.json; the setup kit never overwrites it."""
     path = os.environ.get("AGENTHUB_COMPANIES") or os.path.join(
         os.path.expanduser("~"), ".agenthub", "companies.json")
@@ -130,24 +132,6 @@ def companies() -> dict[str, list[str]]:
         dirs = [dirs] if isinstance(dirs, str) else list(dirs or [])
         out[str(name).strip().lower()] = [os.path.normpath(os.path.expanduser(d)) for d in dirs if d]
     return out
-
-
-def company_of(cwd: str, comps: dict[str, list[str]]) -> str:
-    """The company whose folder holds `cwd` (the deepest match wins), or ''."""
-    if not cwd:
-        return ""
-    want = os.path.normcase(os.path.abspath(cwd))
-    best, depth = "", -1
-    for name, dirs in comps.items():
-        for d in dirs:
-            root = os.path.normcase(os.path.abspath(d))
-            try:
-                inside = os.path.commonpath([want, root]) == root
-            except ValueError:  # different drives
-                inside = False
-            if inside and len(root) > depth:
-                best, depth = name, len(root)
-    return best
 
 
 def load_site() -> dict:

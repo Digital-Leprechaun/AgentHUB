@@ -34,7 +34,13 @@ stays silent on any failure: a hub that is down must never break a session.
 
     python agenthub_hook.py --as claude@desk
     env: AGENTHUB_URL, AGENTHUB_TOKEN; AGENTHUB_EVERY (seconds between mid-task
-    inbox checks, default 5)
+    inbox checks, default 5); AGENTHUB_STAKEHOLDERS (the master STAKEHOLDERS.md, or
+    its folder; default from ~/.agenthub/site.json)
+
+At SessionStart the hook also tells the session its stakeholders: the companies its
+work is for, from a stakeholders.md in the folder it was opened on, checked against
+the master file (see stakeholders_of). The first one listed is the session's company
+on the hub.
 
 The URL and token come from the environment, or else from ~/.agenthub/credentials.json
 (written by install_hooks.py). The file matters: a harness started outside an
@@ -49,6 +55,7 @@ import os
 import re
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -139,40 +146,224 @@ def guard(event: dict, me: str) -> str | None:
             "agenthub_watch.py. Answer only mail delivered to your own session.")
 
 
-def companies() -> dict[str, list[str]]:
-    """This machine's company -> project folders, e.g. {"acme": ["D:/Work/Acme"]}.
-    Each machine keeps its own (folders differ per machine), in $AGENTHUB_COMPANIES or
-    ~/.agenthub/companies.json; the setup kit never overwrites it."""
-    path = os.environ.get("AGENTHUB_COMPANIES") or os.path.join(
-        os.path.expanduser("~"), ".agenthub", "companies.json")
+# -- stakeholders -------------------------------------------------------------
+# A stakeholder is the company a piece of work is for. The master file (STAKEHOLDERS.md,
+# in the agents' shared folder) lists each one as a `## <Name>` section with bullets
+# such as "- color: `#f5a26b`", "- hub: `acme`", "- laws: [..](..)", "- services: ...".
+# A project binds itself to stakeholders with a stakeholders.md in the folder the
+# session is opened on ("- <Name>" lines); only that folder counts, never its parents.
+# No file means the session is open. The first stakeholder listed gives the session its
+# company on the hub (its `hub` label), which colors the session's tasks on the board.
+# (companies.json is no longer read here: it only tells the wake bridge which folder a
+# new session for a company starts in.) server.py parses the same master file for the
+# board: keep the two parsers in step.
+PROJECT_FILE = "stakeholders.md"
+MASTER_FILE = "STAKEHOLDERS.md"
+MASTER_WAIT = 2.0  # seconds to wait for a shared folder that does not answer
+LINK = re.compile(r"\[[^\]]*\]\(([^)\s]+)\)")
+BULLET = re.compile(r"^\s*[-*+]\s+(.*?)\s*$")
+
+
+def norm_company(c: str | None) -> str:
+    """A company label as the hub keeps it. Must match server.py's norm_company."""
+    return re.sub(r"[^a-z0-9._-]", "", (c or "").strip().lower())[:64]
+
+
+def parse_master(text: str) -> list[dict]:
+    """The stakeholders in a master file: name, color, hub label, and its laws and
+    services as link targets (relative to the master file) or plain text ("none yet")."""
+    out: list[dict] = []
+    cur: dict | None = None
+    for line in (text or "").splitlines():
+        if line.startswith("## "):
+            cur = {"name": line[3:].strip(), "color": "", "hub": "", "laws": "", "services": ""}
+            out.append(cur)
+            continue
+        if line.startswith("# "):
+            cur = None
+            continue
+        m = BULLET.match(line)
+        if not (cur is not None and m and ":" in m.group(1)):
+            continue
+        key, val = (x.strip() for x in m.group(1).split(":", 1))
+        key = key.strip("*_ ").lower()
+        if key in ("laws", "services"):
+            cur[key] = LINK.findall(val) or val
+        elif key in ("color", "hub"):
+            cur[key] = val.strip("`'\" ")
+    for s in out:
+        if not re.fullmatch(r"#[0-9a-fA-F]{3,8}", s["color"]):
+            s["color"] = ""
+        s["hub"] = norm_company(s["hub"] or s["name"])
+    return [s for s in out if s["name"]]
+
+
+def read_project(folder: str) -> list[str] | None:
+    """The stakeholder names in <folder>/stakeholders.md, in order; None when there is
+    no such file (an open session). Parent folders are never searched."""
     try:
-        with open(path, encoding="utf-8") as fh:
-            raw = json.load(fh)
-    except (OSError, ValueError):
-        return {}
-    out: dict[str, list[str]] = {}
-    for name, dirs in (raw.items() if isinstance(raw, dict) else []):
-        dirs = [dirs] if isinstance(dirs, str) else list(dirs or [])
-        out[str(name).strip().lower()] = [os.path.normpath(os.path.expanduser(d)) for d in dirs if d]
-    return out
+        with open(os.path.join(folder, PROJECT_FILE), encoding="utf-8-sig", errors="replace") as fh:
+            text = fh.read(65536)
+    except (OSError, TypeError):
+        return None
+    names: list[str] = []
+    for line in text.splitlines():
+        m = BULLET.match(line)
+        name = m.group(1).strip("`*_ ") if m else ""
+        if name and name.lower() not in (n.lower() for n in names):
+            names.append(name)
+    return names
 
 
-def company_of(cwd: str, comps: dict[str, list[str]]) -> str:
-    """The company whose folder holds `cwd` (the deepest match wins), or ''."""
-    if not cwd:
-        return ""
-    want = os.path.normcase(os.path.abspath(cwd))
-    best, depth = "", -1
-    for name, dirs in comps.items():
-        for d in dirs:
-            root = os.path.normcase(os.path.abspath(d))
+def load_site() -> dict:
+    """site.json: $AGENTHUB_SITE, else the copy install_bridge.py keeps in ~/.agenthub/."""
+    for path in (os.environ.get("AGENTHUB_SITE", ""),
+                 os.path.join(os.path.expanduser("~"), ".agenthub", "site.json")):
+        if path and os.path.isfile(path):
             try:
-                inside = os.path.commonpath([want, root]) == root
-            except ValueError:  # different drives
-                inside = False
-            if inside and len(root) > depth:
-                best, depth = name, len(root)
-    return best
+                with open(path, encoding="utf-8-sig") as fh:
+                    return json.load(fh)
+            except (OSError, ValueError):
+                pass
+    return {}
+
+
+def master_path(family: str) -> str:
+    """Where this machine finds the master STAKEHOLDERS.md: $AGENTHUB_STAKEHOLDERS (the
+    file, or the folder holding it), else site.json "stakeholders" (likewise), else
+    STAKEHOLDERS.md in site.json "shared_folder". Either site.json value may be per host,
+    e.g. {"lab": "/mnt/agents", "*": "//fileserver/share/Agents"}. '' when none is set."""
+    host = family.split("@", 1)[1] if "@" in family else ""
+    want = os.environ.get("AGENTHUB_STAKEHOLDERS", "")
+    if not want:
+        site = load_site()
+        for key in ("stakeholders", "shared_folder"):
+            v = site.get(key) or ""
+            if isinstance(v, dict):
+                v = v.get(host) or v.get("*") or ""
+            if v:
+                want = str(v)
+                break
+    if not want:
+        return ""
+    want = os.path.expanduser(want)
+    return os.path.normpath(want if want.lower().endswith(".md") else os.path.join(want, MASTER_FILE))
+
+
+def master_cache() -> str:
+    return os.path.join(tempfile.gettempdir(), ".agenthub-stakeholders.json")
+
+
+def read_master(path: str) -> tuple[list[dict] | None, bool]:
+    """(stakeholders, from_cache). The file is read on a helper thread, so a shared
+    folder that does not answer costs MASTER_WAIT seconds, not the session; then the
+    copy last read on this machine is used. (None, False) when there is neither."""
+    got: list[str] = []
+
+    def read() -> None:
+        try:
+            with open(path, encoding="utf-8-sig", errors="replace") as fh:
+                got.append(fh.read(262144))
+        except OSError:
+            pass
+
+    if path:
+        t = threading.Thread(target=read, daemon=True)
+        t.start()
+        t.join(MASTER_WAIT)
+    if got:
+        parsed = parse_master(got[0])
+        try:
+            with open(master_cache(), "w", encoding="utf-8") as fh:
+                json.dump({"path": path, "stakeholders": parsed}, fh)
+        except OSError:
+            pass
+        return parsed, False
+    try:
+        with open(master_cache(), encoding="utf-8") as fh:
+            cached = json.load(fh)
+        if path and cached.get("path") == path:
+            return list(cached.get("stakeholders") or []), True
+    except (OSError, ValueError, AttributeError):
+        pass
+    return None, False
+
+
+def stakeholders_of(cwd: str, family: str) -> dict:
+    """The stakeholders of a session opened on `cwd`: {"company", "note"}. `company` is
+    the hub label of the first stakeholder listed ('' for an open session, or when that
+    one is not in the master file); `note` is what the session is told at SessionStart."""
+    names = read_project(cwd)
+    if names is None:
+        return {"company": "", "note": "[AgentHub] This session is open: its folder has no "
+                                       "stakeholders.md, so only the shared laws apply."}
+    where = os.path.normpath(os.path.join(cwd, PROJECT_FILE))
+    if not names:
+        return {"company": "", "note": f"[AgentHub] WARNING: {where} lists no stakeholders. Tell "
+                                       "the human before doing any work."}
+    path = master_path(family)
+    master, stale = read_master(path)
+    if master is None:
+        why = (f"{path} cannot be read" if path else "this machine has no master file configured "
+               "(AGENTHUB_STAKEHOLDERS, or site.json \"stakeholders\" or \"shared_folder\")")
+        return {"company": "", "note": f"[AgentHub] WARNING: {where} names {', '.join(names)}, but "
+                                       f"{why}, so they cannot be checked. Tell the human before "
+                                       "doing any work."}
+    by_name = {s["name"].lower(): s for s in master}
+    known = [by_name[n.lower()] for n in names if n.lower() in by_name]
+    unknown = [n for n in names if n.lower() not in by_name]
+    first = by_name.get(names[0].lower())
+    base = os.path.dirname(path)
+
+    def files(v) -> str:
+        if isinstance(v, list):
+            return ", ".join(os.path.normpath(os.path.join(base, x)) for x in v) or "none"
+        return v or "none"
+
+    lines = []
+    if known:
+        each = "; ".join(f"{s['name']} (laws: {files(s['laws'])}; services: {files(s['services'])})"
+                         for s in known)
+        lines.append(f"[AgentHub] This session's stakeholders: {each}. Their laws and services add "
+                     "to the shared ones: read them before working for them."
+                     + (f" Your tasks are filed for {first['name']} (hub company {first['hub']})."
+                        if first else ""))
+    if unknown:
+        lines.append(f"[AgentHub] WARNING: {where} names {', '.join(unknown)}, which "
+                     f"{'is' if len(unknown) == 1 else 'are'} not in the master stakeholder file "
+                     f"{path}. Tell the human before doing any work.")
+    if stale:
+        lines.append(f"[AgentHub] {path} could not be read just now; the stakeholders above come "
+                     "from the copy last read on this machine.")
+    return {"company": first["hub"] if first else "", "note": "\n".join(lines)}
+
+
+def stake_cache(sid: str) -> str:
+    return os.path.join(tempfile.gettempdir(), f".agenthub-stake-{sid}.json")
+
+
+def session_stakeholders(event: dict, me: str, family: str, cwd: str) -> dict:
+    """stakeholders_of() the folder the session was opened on: worked out at SessionStart
+    and remembered for the session's later events, whose cwd may have moved. After a
+    compaction (SessionStart again) the remembered answer is repeated."""
+    sid = me.rsplit("/", 1)[-1]
+    fresh = event.get("hook_event_name") == "SessionStart" and event.get("source") != "compact"
+    if not fresh:
+        try:
+            with open(stake_cache(sid), encoding="utf-8") as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            pass  # a session older than this hook: work it out now, once
+    try:
+        info = stakeholders_of(cwd, family)
+    except Exception:  # noqa: BLE001
+        info = {"company": "", "note": ""}
+    try:
+        with open(stake_cache(sid), "w", encoding="utf-8") as fh:
+            json.dump(info, fh)
+    except OSError:
+        pass
+    return info
 
 
 def session_title(transcript: str) -> str:
@@ -345,8 +536,14 @@ def main() -> None:
             note_hub_use(event, me)
         return
 
+    # The stakeholders of the folder the session was opened on, worked out even when the
+    # hub cannot be reached: an unknown stakeholder must stop the agent either way.
+    cwd = event.get("cwd") or os.getcwd()
+    stake = session_stakeholders(event, me, family, cwd) if me and me != family else {}
     url, token = credentials()
     if not (family and url and token):
+        if name == "SessionStart" and stake.get("note") and not event.get("agent_id"):
+            emit({"hookSpecificOutput": {"hookEventName": name, "additionalContext": stake["note"]}})
         return
 
     # Mail is for the parent session, never a subagent: from inside a subagent only
@@ -355,10 +552,9 @@ def main() -> None:
     title = session_title(event.get("transcript_path") or "") if me != family else ""
     try:
         m = CLAIM_TOKEN.search(event.get("prompt") or "") if name == "UserPromptSubmit" else None
-        cwd = event.get("cwd") or os.getcwd()
         r = RESUMED_FROM.search(event.get("prompt") or "") if name == "UserPromptSubmit" else None
         text = poll(url, token, me, stop_only, name, session, cwd,
-                    m.group(1) if m else "", company_of(cwd, companies()) if me != family else "",
+                    m.group(1) if m else "", stake.get("company", ""),
                     title, r.group(1) if r else "")
     except Exception:  # noqa: BLE001
         text = ""
@@ -374,7 +570,7 @@ def main() -> None:
                  f"every hub call{watch}. Mail to it reaches only this session: answer only mail "
                  f"delivered to this session, never another session's. {family_mail} Give "
                  "yourself a readable alias with hub_hello(label=...) if others need one.")
-        text = ident + ("\n" + text if text else "")
+        text = "\n".join(t for t in (ident, stake.get("note"), text) if t)
     if not text or name == "SessionEnd":
         return
 

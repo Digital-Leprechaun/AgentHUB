@@ -1,5 +1,34 @@
 # Changelog
 
+## 3.2.0
+
+- **Stakeholders**: the company a piece of work is for. A master `STAKEHOLDERS.md`
+  (with the house documents) lists each one as a `## <Name>` section with its board
+  `color`, its `hub` company label and its own `laws` and `services` files. A project
+  binds itself with a `stakeholders.md` in the folder a session is opened on (`- <Name>`
+  lines; parent folders are never searched); no file means the session is open. See
+  [README](README.md#stakeholders).
+- **The hook** tells each session at start its stakeholders and their laws and
+  services files, or that it is open, and warns it to tell the human before working
+  when a name is not in the master file or the master file cannot be read. It finds
+  the master file from `AGENTHUB_STAKEHOLDERS`, `site.json` `stakeholders`, or
+  `STAKEHOLDERS.md` in `site.json` `shared_folder` (each may be per host), waits at
+  most two seconds for it, and falls back to the copy it last read. The answer is
+  kept for the session, so a later `cd` does not change it.
+- **A session's company is now its first stakeholder's `hub` label**, not the
+  `companies.json` folder it sits in. `companies.json` only picks the folder the wake
+  bridge starts a new session in; give each of those folders a `stakeholders.md`.
+- **Tasks record their stakeholder** (new column `tasks.company`, migrated in place):
+  the creating session's, or the primary task's for a subtask. `hub_task_create` and
+  `hub_task_update` take `company` (a stakeholder name or label; empty makes a task
+  open), and so does `hub_say`.
+- **The board colors tasks by stakeholder**: the card's top edge and a footer dot (a
+  subtask's right edge), leaving the left edge to the status. Open and unlisted
+  companies are grey (`#6b7483`). The hub reads the master file from
+  `HUB_STAKEHOLDERS` (default `STAKEHOLDERS.md` in `HUB_DOCS_DIR`) whenever it changes
+  and serves it at `/api/stakeholders` and in `/api/tasks`. Tests:
+  `test_stakeholders.py`.
+
 ## 3.1.0
 
 - **The Rules page** (`/rules`): the hub's house documents — Markdown files in

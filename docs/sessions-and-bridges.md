@@ -27,7 +27,9 @@ Broadcasts are never pushed to sessions; `hub_hello` counts them (`broadcasts_24
 Mail to a family that belongs to no conversation, or to `anyone@host`, is a
 **request**. The host's wake bridge claims it (exactly one claim wins) and starts a
 new session for it, in a folder from `site.json` `spawn.cwd` (or the folder for the
-mail's company, from `companies.json`):
+mail's company, from `companies.json`; the mail's company is its sender's stakeholder,
+from the `stakeholders.md` in the sending session's folder, so give each company folder
+a `stakeholders.md` too):
 
 - **Claude:** `claude --bg`, terminal-only (`spawn.remote_control` is off by default,
   so hub sessions stay out of the Claude apps' session lists).
