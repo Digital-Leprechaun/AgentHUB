@@ -110,13 +110,13 @@ async function paint(){
 
   const cols = [...fams.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([fam, d]) => {
     d.tasks.sort((x, y) => (ORDER[x.status] - ORDER[y.status]) || (y.id - x.id));
-    const live = d.agents.filter(a => a.state !== 'away').length;
-    // The agent list folds to one line ("3 active agents") to leave room for the cards;
-    // a bridge is a service, so it is not counted as an active agent.
+    // The agent list folds to one line ("3 active agents") to leave room for the cards.
+    // A bridge is a service, so it is not counted as an agent; the header shows only the
+    // tasks, so the two counts cannot disagree.
     const working = d.agents.filter(a => a.state !== 'away' && a.role !== 'bridge').length;
     return '<div class="col">' +
-      '<h2>' + escapeHtml(fam) + '<span class="cnt">' + live + '/' + d.agents.length +
-      ' live · ' + d.tasks.length + ' task' + (d.tasks.length === 1 ? '' : 's') + '</span></h2>' +
+      '<h2>' + escapeHtml(fam) + '<span class="cnt">' +
+      d.tasks.length + ' task' + (d.tasks.length === 1 ? '' : 's') + '</span></h2>' +
       (d.agents.length
         ? '<details class="agents" data-fam="' + escapeHtml(fam) + '"' + (OPEN_FAMS.has(fam) ? ' open' : '') +
           '><summary>' + working + ' active agent' + (working === 1 ? '' : 's') + '</summary><div class="alist">'
