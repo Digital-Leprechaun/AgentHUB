@@ -36,6 +36,12 @@ const CLOSED = s => s === 'done' || s === 'elevated';
 let KIDS = new Map();  // primary task id -> its subtasks
 const PLANNING_LIMIT = 3;  // HUB_PLANNING_TURNS
 
+// Families whose agent list is unfolded. Folded by default; remembered in this browser
+// so a repaint (every 15s, or on any task or message) keeps what the viewer opened.
+const OPEN_FAMS = new Set((() => {
+  try { return JSON.parse(localStorage.getItem('board.openFams') || '[]'); } catch { return []; }
+})());
+
 // A subtask, inside its primary task's card: who is working it, and its state.
 function sub(t){
   // The Orchestrator's own hub-using subagents read as "subagent <role>".
@@ -105,10 +111,16 @@ async function paint(){
   const cols = [...fams.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([fam, d]) => {
     d.tasks.sort((x, y) => (ORDER[x.status] - ORDER[y.status]) || (y.id - x.id));
     const live = d.agents.filter(a => a.state !== 'away').length;
+    // The agent list folds to one line ("3 active agents") to leave room for the cards;
+    // a bridge is a service, so it is not counted as an active agent.
+    const working = d.agents.filter(a => a.state !== 'away' && a.role !== 'bridge').length;
     return '<div class="col">' +
       '<h2>' + escapeHtml(fam) + '<span class="cnt">' + live + '/' + d.agents.length +
       ' live · ' + d.tasks.length + ' task' + (d.tasks.length === 1 ? '' : 's') + '</span></h2>' +
-      '<div class="agents">' + (d.agents.length
+      (d.agents.length
+        ? '<details class="agents" data-fam="' + escapeHtml(fam) + '"' + (OPEN_FAMS.has(fam) ? ' open' : '') +
+          '><summary>' + working + ' active agent' + (working === 1 ? '' : 's') + '</summary><div class="alist">'
+        : '<div class="agents">') + (d.agents.length
         // A bridge is a service, not a worker: it never reads an inbox, so its unread
         // count would climb forever and mean nothing.
         // A session shows its label (if it took one) and its id; hover for its folder.
@@ -120,8 +132,8 @@ async function paint(){
               ? (a.label ? a.label + ' · ' : '') + a.role + (a.spawned_for ? ' ✦' : '')
               : (a.role ? a.role : '(main)')) +
             (a.unread && a.role !== 'bridge' ? ' <span class="u">' + a.unread + '</span>' : '') +
-            '</span>').join('')
-        : '<span class="a">no agent seen</span>') + '</div>' +
+            '</span>').join('') + '</div></details>'
+        : '<span class="a">no agent seen</span></div>') +
       '<div class="cards">' + (d.tasks.length ? d.tasks.map(card).join('')
         : '<div class="empty">nothing in flight</div>') + '</div></div>';
   });
@@ -164,6 +176,14 @@ board.addEventListener('click', async e => {
     paint();
   } catch (err) { alert(err.message); }
 });
+
+// 'toggle' does not bubble, so listen while it travels down.
+board.addEventListener('toggle', e => {
+  const fam = e.target.dataset && e.target.dataset.fam;
+  if (fam == null) return;
+  if (e.target.open) OPEN_FAMS.add(fam); else OPEN_FAMS.delete(fam);
+  try { localStorage.setItem('board.openFams', JSON.stringify([...OPEN_FAMS])); } catch {}
+}, true);
 
 subscribe(ev => { if (ev.type === 'task' || ev.type === 'message') paint(); });
 paint();

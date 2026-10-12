@@ -60,17 +60,33 @@ form#composer{display:flex;gap:8px;padding:10px 16px;background:var(--panel);
 #stopbar .resume{margin-left:8px;padding:1px 8px;font-size:11px;color:#ffd4d4;border-color:#6b2a2a}
 
 /* board */
-.board{flex:1;overflow:auto;display:flex;gap:12px;padding:14px 16px;align-items:flex-start}
+/* The whole board scrolls, with both scrollbars always shown, so long columns are
+   reached from the window edge rather than from a scroller inside each column. */
+.board{flex:1;overflow:scroll;display:flex;gap:12px;padding:14px 16px;align-items:flex-start;
+  scrollbar-color:#5d6878 var(--bg)}
+.board::-webkit-scrollbar{width:12px;height:12px}
+.board::-webkit-scrollbar-track{background:var(--bg)}
+.board::-webkit-scrollbar-thumb{background:#5d6878;border-radius:6px;border:2px solid var(--bg)}
+.board::-webkit-scrollbar-thumb:hover{background:#7a8594}
+.board::-webkit-scrollbar-corner{background:var(--bg)}
 .col{background:var(--panel);border:1px solid var(--line);border-radius:9px;
-  min-width:255px;max-width:320px;flex:1 0 255px;display:flex;flex-direction:column;max-height:100%}
+  min-width:255px;max-width:320px;flex:1 0 255px;display:flex;flex-direction:column}
 .col.done{flex-basis:290px}
 .col > h2{margin:0;padding:10px 12px;font-size:13px;border-bottom:1px solid var(--line);
   display:flex;align-items:center;gap:7px}
 .col h2 .cnt{margin-left:auto;color:var(--dim);font-weight:500;font-size:11px}
 .col .agents{padding:6px 12px;border-bottom:1px solid var(--line);font-size:11px;color:var(--dim);
   display:flex;flex-direction:column;gap:3px}
+.col details.agents{display:block}
+.col details.agents summary{cursor:pointer;user-select:none;list-style:none;display:flex;
+  align-items:center;gap:6px}
+.col details.agents summary::-webkit-details-marker{display:none}
+.col details.agents summary::before{content:"▸";font-size:10px;width:8px}
+.col details.agents[open] summary::before{content:"▾"}
+.col details.agents summary:hover{color:var(--ink)}
+.col details.agents .alist{display:flex;flex-direction:column;gap:3px;margin-top:4px}
 .col .agents .a{display:flex;align-items:center;gap:6px}
-.cards{padding:8px;overflow-y:auto;display:flex;flex-direction:column;gap:7px}
+.cards{padding:8px;display:flex;flex-direction:column;gap:7px}
 .card{background:#20252c;border:1px solid #2b323b;border-left:3px solid var(--pending);
   border-radius:6px;padding:8px 10px}
 .card.active{border-left-color:var(--active)}
