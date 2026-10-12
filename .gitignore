@@ -17,3 +17,9 @@ site.json
 
 __pycache__/
 *.pyc
+
+# AgentHub Viewer build output and its site config (the hub URL)
+viewer/bin/
+viewer/obj/
+viewer/publish/
+viewer/viewer.json

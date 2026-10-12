@@ -114,3 +114,7 @@ document.addEventListener('DOMContentLoaded', () => {
     bar.hidden = true;
   };
 });
+
+// In the AgentHub Viewer app (its own window, no browser around it) the pages drop the
+// parts that only make sense in a browser tab: see html.app in hub.css.
+if (navigator.userAgent.includes('AgentHubViewer')) document.documentElement.classList.add('app');
