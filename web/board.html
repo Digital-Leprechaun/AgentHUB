@@ -22,8 +22,8 @@
   <input id="nowner" placeholder="owner (claude@desk)" autocomplete="off" style="width:200px">
   <button id="add">add task</button>
   <span class="hint">Columns are agent families (vendor@host). A task's subtasks sit inside its card,
-    each with the Worker running it (↳). A card's top edge is its stakeholder's color (grey: open). Click a card or subtask to move it forward; shift-click a
-    completed one to reopen it.</span>
+    each with the Worker running it (↳). A card's top edge is its stakeholder's color (grey: open). Click a card or subtask to read it in its own window;
+    right-click it to change its status.</span>
 </section>
 
 <main class="board" id="board"></main>
@@ -94,7 +94,7 @@ function card(t){
     (t.topic ? '<span class="topic">#' + escapeHtml(t.topic) + '</span>' : '') +
     '<span class="sh" title="stakeholder: ' + escapeHtml(s.name) + '">' + escapeHtml(s.label || s.name) + '</span>' +
     '<span title="task id · messages">#' + t.id + (t.messages ? ' · ' + t.messages + ' msg' : '') + '</span>' +
-    '<span class="owner">' + escapeHtml(t.owner) + '</span></div>' + subs(t) + '</div>';
+    '<span class="owner" title="' + escapeHtml(t.owner) + '">' + escapeHtml(t.owner) + '</span></div>' + subs(t) + '</div>';
 }
 
 async function paint(){
@@ -179,23 +179,16 @@ document.getElementById('add').onclick = async () => {
   } catch (e) { alert(e.message); }
 };
 
-// Click a card to move it forward: planning/pending/blocked -> active -> done.
-// A finished card stays finished: reopening needs shift-click, so a stray click on the
-// Completed column cannot quietly send work back to pending.
-board.addEventListener('click', async e => {
-  if (e.target.closest('summary')) return;  // opening the finished-subtasks list
+// A click only opens the task in a window of its own, to read; changing a task's status
+// takes the right-click menu (taskMenu, hub.js), so a stray click never moves work.
+board.addEventListener('click', e => {
+  if (e.target.closest('summary')) return;  // folding the agent or finished-subtask list
   const el = e.target.closest('.sub') || e.target.closest('.card');
   if (!el) return;
   e.stopPropagation();
-  const cur = [...el.classList].find(c => c in ORDER);
-  if (CLOSED(cur) && !e.shiftKey) return;
-  const next = { planning: 'active', pending: 'active', active: 'done', blocked: 'active', done: 'pending',
-                 elevated: 'pending' }[cur];
-  try {
-    await api('/api/task/update', 'POST', { as: identity().me, id: +el.dataset.id, status: next });
-    paint();
-  } catch (err) { alert(err.message); }
+  openTask(+el.dataset.id);
 });
+taskMenu(board, paint);
 
 // 'toggle' does not bubble, so listen while it travels down.
 board.addEventListener('toggle', e => {

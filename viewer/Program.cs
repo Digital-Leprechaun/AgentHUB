@@ -19,7 +19,7 @@ static class Program
     static void Main(string[] args)
     {
         ApplicationConfiguration.Initialize();
-        Application.Run(new ViewerForm(HubUrl(args)));
+        Application.Run(new ViewerForm(HubUrl(args), null));
     }
 
     static string HubUrl(string[] args)
@@ -87,13 +87,21 @@ sealed class ViewerForm : Form
         ("Rules", "/rules", Keys.Control | Keys.D4),
     };
 
+    // Every window shares one browser profile, so the identity set in one (stored by the
+    // pages in localStorage) holds in all of them.
+    static Task<CoreWebView2Environment>? environment;
+
     readonly string hub;
-    readonly State state = State.Load();
+    readonly string? popup;  // a page opened from another window (a task); null for the main one
+    readonly State state;
     readonly WebView2 web = new() { Dock = DockStyle.Fill };
 
-    public ViewerForm(string hub)
+    public ViewerForm(string hub, string? popup, Form? opener = null)
     {
         this.hub = hub;
+        this.popup = popup;
+        // Only the main window remembers its place and page.
+        state = popup is null ? State.Load() : new State { W = 560, H = 720, OnTop = opener?.TopMost ?? false };
         Text = "AgentHub";
         BackColor = Color.FromArgb(0x14, 0x16, 0x1a);  // the pages' --bg, so no white flash
         Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
@@ -101,6 +109,7 @@ sealed class ViewerForm : Form
         TopMost = state.OnTop;
 
         StartPosition = FormStartPosition.Manual;
+        if (opener is not null) (state.X, state.Y) = (opener.Left + 60, opener.Top + 60);
         var bounds = new Rectangle(state.X, state.Y, state.W, state.H);
         if (state.X < 0 || !Screen.AllScreens.Any(s => s.WorkingArea.IntersectsWith(bounds)))
             bounds = new Rectangle(Screen.PrimaryScreen!.WorkingArea.Location + new Size(40, 40), bounds.Size);
@@ -109,15 +118,15 @@ sealed class ViewerForm : Form
 
         Controls.Add(web);
         Load += async (_, _) => await StartAsync();
-        FormClosing += (_, _) => SaveState();
+        FormClosing += (_, _) => { if (popup is null) SaveState(); };
     }
 
     async Task StartAsync()
     {
         try
         {
-            var env = await CoreWebView2Environment.CreateAsync(null, State.UserDataFolder);
-            await web.EnsureCoreWebView2Async(env);
+            environment ??= CoreWebView2Environment.CreateAsync(null, State.UserDataFolder);
+            await web.EnsureCoreWebView2Async(await environment);
         }
         catch (WebView2RuntimeNotFoundException)
         {
@@ -135,8 +144,16 @@ sealed class ViewerForm : Form
         cw.Settings.IsPasswordAutosaveEnabled = false;
         web.ZoomFactor = state.Zoom;
 
-        // Links that leave the hub open in the real browser, not in this window.
-        cw.NewWindowRequested += (_, e) => { e.Handled = true; OpenOutside(e.Uri); };
+        // A hub page asking for a window of its own (a task) gets a viewer window; links
+        // that leave the hub open in the real browser.
+        cw.NewWindowRequested += (_, e) =>
+        {
+            e.Handled = true;
+            if (e.Uri.StartsWith(hub, StringComparison.OrdinalIgnoreCase))
+                new ViewerForm(hub, e.Uri[hub.Length..], this).Show();
+            else
+                OpenOutside(e.Uri);
+        };
         cw.NavigationStarting += (_, e) =>
         {
             if (!e.Uri.StartsWith(hub, StringComparison.OrdinalIgnoreCase)) { e.Cancel = true; OpenOutside(e.Uri); }
@@ -144,11 +161,12 @@ sealed class ViewerForm : Form
         cw.DocumentTitleChanged += (_, _) => Text = cw.DocumentTitle;
         cw.SourceChanged += (_, _) =>
         {
-            if (Uri.TryCreate(cw.Source, UriKind.Absolute, out var u)) state.Page = u.PathAndQuery;
+            if (popup is null && Uri.TryCreate(cw.Source, UriKind.Absolute, out var u)) state.Page = u.PathAndQuery;
         };
         cw.ContextMenuRequested += OnContextMenu;
 
-        web.Source = new Uri(hub + (state.Page.StartsWith('/') ? state.Page : "/board"));
+        var page = popup ?? state.Page;
+        web.Source = new Uri(hub + (page.StartsWith('/') ? page : "/board"));
     }
 
     void OnContextMenu(object? sender, CoreWebView2ContextMenuRequestedEventArgs e)

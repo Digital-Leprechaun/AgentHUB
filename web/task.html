@@ -1,0 +1,79 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AgentHub — task</title>
+<link rel="stylesheet" href="hub.css">
+<header>
+  <h1>Agent<span>Hub</span></h1>
+  <span id="tid" class="tid"></span>
+  <span class="grow"></span>
+</header>
+
+<main id="task" class="taskview"><div class="empty">loading…</div></main>
+
+<script src="hub.js"></script>
+<script>
+// One task on its own, easier to read than its card: the whole text, its subtasks and
+// every message tagged with it. Opened from the board; right-click changes the status.
+const ID = +new URLSearchParams(location.search).get('id');
+const view = document.getElementById('task');
+const when = ts => ts ? escapeHtml(ts.replace('T', ' ').replace('Z', '')) : '';
+
+function who(t){
+  const w = t.worker || '';
+  return !w ? '' : w.startsWith((t.owner || '') + '/') ? 'subagent ' + w.slice(t.owner.length + 1) : w;
+}
+
+function line(label, value){
+  return value ? '<div class="kv"><span>' + label + '</span><b>' + value + '</b></div>' : '';
+}
+
+async function paint(){
+  let tasks = [], msgs = [];
+  try {
+    tasks = (await api('/api/tasks')).tasks || [];
+    msgs = (await api('/api/messages?task_id=' + ID + '&limit=500&include_archived=1')).messages || [];
+  } catch (e) { view.innerHTML = '<div class="empty">' + escapeHtml(e.message) + '</div>'; return; }
+  const t = tasks.find(x => x.id === ID);
+  if (!t) { view.innerHTML = '<div class="empty">task #' + ID + ' not found</div>'; return; }
+  const parent = t.parent_id != null ? tasks.find(x => x.id === t.parent_id) : null;
+  const kids = tasks.filter(x => x.parent_id === ID).sort((a, b) => a.id - b.id);
+  document.title = '#' + t.id + ' ' + t.title;
+  document.getElementById('tid').textContent = 'task #' + t.id;
+  msgs.sort((a, b) => a.id - b.id);
+
+  view.innerHTML =
+    '<section class="card ' + t.status + '" data-id="' + t.id + '">' +
+      '<div class="t">' + escapeHtml(t.title) + '</div>' +
+      '<div class="f"><span class="badge ' + t.status + '">' + t.status + '</span>' +
+      (t.topic ? '<span class="topic">#' + escapeHtml(t.topic) + '</span>' : '') + '</div>' +
+      (t.body ? '<div class="b">' + escapeHtml(t.body) + '</div>' : '') +
+      '<div class="meta">' +
+        line('owner', escapeHtml(t.owner)) +
+        line('worker', escapeHtml(who(t))) +
+        line('part of', parent ? '<a href="task.html?id=' + parent.id + '">#' + parent.id + ' ' +
+          escapeHtml(parent.title) + '</a>' : '') +
+        line('created', when(t.created)) +
+        line('updated', when(t.updated)) +
+        line('finished', when(t.done_at)) +
+      '</div>' +
+    '</section>' +
+    (kids.length ? '<h3>Subtasks</h3><div class="kids">' + kids.map(k =>
+      '<div class="sub ' + k.status + '" data-id="' + k.id + '"><div class="sl"><span class="badge ' +
+      k.status + '">' + k.status + '</span><a class="st" href="task.html?id=' + k.id + '">' +
+      escapeHtml(k.title) + '</a></div><div class="sm"><span class="sw">↳ ' +
+      escapeHtml(who(k) || 'unassigned') + '</span><span class="si">#' + k.id + '</span></div></div>').join('') +
+      '</div>' : '') +
+    '<h3>Messages <span class="cnt">' + msgs.length + '</span></h3>' +
+    (msgs.length ? msgs.map(m =>
+      '<div class="msg"><div class="meta"><b>' + escapeHtml(m.from) + '</b>' +
+      '<span class="to">→ ' + (m.to && m.to.length ? m.to.map(escapeHtml).join(', ') : 'all') + '</span>' +
+      '<time>' + when(m.ts) + '</time><span class="id">#' + m.id + '</span></div>' +
+      '<div class="body">' + escapeHtml(m.body) + '</div></div>').join('')
+      : '<div class="empty">no messages tagged with this task</div>');
+}
+
+taskMenu(view, paint);
+subscribe(ev => { if (ev.type === 'task' || ev.type === 'message') paint(); });
+paint();
+</script>

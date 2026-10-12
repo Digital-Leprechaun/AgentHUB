@@ -109,7 +109,9 @@ form#composer{display:flex;gap:8px;padding:10px 16px;background:var(--panel);
 .badge.active{color:var(--active)}
 .badge.blocked{color:var(--blocked)}
 .badge.done{color:var(--done)}
-.card .owner{margin-left:auto;opacity:.8}
+/* A session address is long; it never runs past the card (the whole address is in its title). */
+.card .owner{margin-left:auto;opacity:.8;min-width:0;max-width:100%;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
 .card.elevated{border-left-color:#5fb3ff;opacity:.7}
 .badge.elevated{color:#5fb3ff}
 /* Subtasks, inside their primary task's card: one line each, with the Worker running it. */
@@ -221,3 +223,29 @@ html.app h1{display:none}
 html.app .hint{display:none}
 html.app section#bar{padding:6px 10px}
 html.app .board{padding:8px 10px;gap:8px}
+
+/* The right-click menu on a task (taskMenu in hub.js). */
+.card,.sub{cursor:pointer}
+.ctxmenu{position:fixed;z-index:50;min-width:150px;background:var(--panel);border:1px solid var(--line);
+  border-radius:7px;padding:4px;box-shadow:0 6px 24px rgba(0,0,0,.5);display:flex;flex-direction:column}
+.ctxmenu .ch{font-size:11px;color:var(--dim);padding:3px 9px 5px}
+.ctxmenu button{background:none;color:var(--ink);font-weight:500;text-align:left;padding:5px 9px;
+  border-radius:5px;font-size:13px}
+.ctxmenu button:hover{background:#232830;filter:none}
+.ctxmenu hr{border:0;border-top:1px solid var(--line);margin:3px 0}
+
+/* One task in a window of its own (task.html). */
+header .tid{color:var(--dim);font-size:13px}
+main.taskview{flex:1;overflow-y:auto;padding:12px 14px 30px}
+.taskview .card{cursor:default}
+.taskview .card .t{font-size:16px}
+.taskview .card .b{font-size:13px;color:var(--ink);margin-top:8px;line-height:1.5}
+.taskview .meta{margin-top:10px;display:grid;grid-template-columns:auto 1fr;gap:2px 12px;font-size:12px}
+.taskview .kv{display:contents}
+.taskview .kv span{color:var(--dim)}
+.taskview .kv b{font-weight:500;word-break:break-word}
+.taskview .kv a,.taskview .sub a{color:var(--accent);text-decoration:none}
+.taskview h3{font-size:13px;margin:18px 0 6px;display:flex;gap:8px;align-items:baseline}
+.taskview h3 .cnt{color:var(--dim);font-weight:500;font-size:11px}
+.taskview .kids{display:flex;flex-direction:column;gap:3px}
+.taskview .msg .meta{display:flex;margin-top:0;font-size:11px}

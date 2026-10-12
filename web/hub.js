@@ -118,3 +118,56 @@ document.addEventListener('DOMContentLoaded', () => {
 // In the AgentHub Viewer app (its own window, no browser around it) the pages drop the
 // parts that only make sense in a browser tab: see html.app in hub.css.
 if (navigator.userAgent.includes('AgentHubViewer')) document.documentElement.classList.add('app');
+
+// A task in a window of its own (task.html), one window per task.
+function openTask(id){
+  window.open('task.html?id=' + id, 'task-' + id, 'popup,width=560,height=720');
+}
+
+// The right-click menu on a task (any element with class card or sub and data-id inside
+// `root`): open it, or change its status. `after` runs once a change is saved.
+function taskMenu(root, after){
+  const close = () => document.querySelectorAll('.ctxmenu').forEach(m => m.remove());
+  root.addEventListener('contextmenu', e => {
+    const el = e.target.closest('.sub[data-id], .card[data-id]');
+    if (!el) return;
+    e.preventDefault();
+    close();
+    const id = +el.dataset.id;
+    const cur = ['active', 'planning', 'blocked', 'pending', 'done', 'elevated'].find(c => el.classList.contains(c));
+    const closed = cur === 'done' || cur === 'elevated';
+    const items = [['Open in window', () => openTask(id)], null];
+    if (closed) items.push(['Reopen', 'pending']);
+    else {
+      if (cur !== 'active') items.push(['Start', 'active']);
+      if (cur !== 'blocked') items.push(['Block', 'blocked']);
+      if (cur !== 'pending') items.push(['Set pending', 'pending']);
+      items.push(['Done', 'done']);
+    }
+    const m = document.createElement('div');
+    m.className = 'ctxmenu';
+    m.innerHTML = '<div class="ch">#' + id + ' · ' + escapeHtml(cur || '') + '</div>' + items.map((it, i) =>
+      it ? '<button data-i="' + i + '">' + escapeHtml(it[0]) + '</button>' : '<hr>').join('');
+    document.body.appendChild(m);
+    const r = m.getBoundingClientRect();
+    m.style.left = Math.max(4, Math.min(e.clientX, innerWidth - r.width - 4)) + 'px';
+    m.style.top = Math.max(4, Math.min(e.clientY, innerHeight - r.height - 4)) + 'px';
+    m.addEventListener('click', async ev => {
+      const b = ev.target.closest('button');
+      if (!b) return;
+      const act = items[+b.dataset.i][1];
+      close();
+      if (typeof act === 'function') return act();
+      try { await api('/api/task/update', 'POST', { as: identity().me, id, status: act }); }
+      catch (err) { alert(err.message); }
+      if (after) after();
+    });
+  });
+  if (!taskMenu.wired) {
+    taskMenu.wired = true;
+    document.addEventListener('mousedown', e => { if (!e.target.closest('.ctxmenu')) close(); });
+    document.addEventListener('keydown', e => { if (e.key === 'Escape') close(); });
+    addEventListener('blur', close);
+    document.addEventListener('scroll', close, true);
+  }
+}
