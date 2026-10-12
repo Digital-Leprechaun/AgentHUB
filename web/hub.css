@@ -16,13 +16,9 @@ nav{display:flex;gap:4px}
 nav a{color:var(--dim);text-decoration:none;padding:4px 10px;border-radius:6px;font-size:13px}
 nav a:hover{background:#232830;color:var(--ink)}
 nav a.on{background:#232830;color:var(--accent)}
-.who{margin-left:auto;display:flex;gap:10px;flex-wrap:wrap;font-size:12px;color:var(--dim)}
-.who .a{display:flex;align-items:center;gap:5px;white-space:nowrap}
 .dot{width:7px;height:7px;border-radius:50%;background:var(--away);flex:0 0 auto}
 .dot.connected{background:var(--ok);box-shadow:0 0 6px var(--ok)}
 .dot.active{background:var(--warn)}
-.who .n{font-weight:600;color:var(--ink)}
-.who .u{background:var(--accent);color:#0d1014;border-radius:9px;padding:0 5px;font-size:10px;font-weight:700}
 button{background:var(--accent);color:#0d1014;border:0;border-radius:6px;padding:6px 12px;
   font:inherit;font-weight:600;cursor:pointer}
 button:hover{filter:brightness(1.1)}
@@ -172,3 +168,26 @@ form#composer{display:flex;gap:8px;padding:10px 16px;background:var(--panel);
 .md table{border-collapse:collapse;margin:10px 0;font-size:13px;display:block;overflow-x:auto}
 .md th,.md td{border:1px solid var(--line);padding:5px 9px;text-align:left;vertical-align:top}
 .md th{background:var(--panel)}
+
+/* agents */
+main#agents{flex:1;overflow-y:auto;padding:12px 16px 40px}
+.host{margin-bottom:22px}
+.host > h2{font-size:12px;text-transform:uppercase;letter-spacing:.8px;color:var(--dim);margin:6px 0 8px}
+.fam{background:var(--panel);border:1px solid var(--line);border-radius:9px;margin-bottom:10px;overflow-x:auto}
+.fam h3{margin:0;padding:9px 12px;font-size:13px;display:flex;align-items:center;gap:12px;
+  border-bottom:1px solid var(--line)}
+.fam .br{display:flex;align-items:center;gap:5px;font-size:11px;font-weight:500;color:var(--dim)}
+.fam .br.none{color:var(--away)}
+.fam .cnt{margin-left:auto;color:var(--dim);font-weight:500;font-size:11px}
+.fam table{width:100%;border-collapse:collapse;font-size:12.5px}
+.fam th{text-align:left;font-weight:500;font-size:11px;color:var(--dim);padding:5px 10px}
+.fam td{padding:5px 10px;border-top:1px solid #232930;vertical-align:middle;white-space:nowrap}
+.fam td:first-child,.fam th:first-child{width:18px;padding-right:0}
+.fam .addr{font-weight:600}
+.fam .ttl{white-space:normal;min-width:180px}
+.fam .cwd{color:var(--dim);max-width:260px;overflow:hidden;text-overflow:ellipsis}
+.fam .co{background:#232a33;border-radius:4px;padding:0 5px;font-size:10.5px;margin-left:4px}
+.fam .ev,.fam .seen{color:var(--dim);font-size:11.5px}
+.fam .u{background:var(--accent);color:#0d1014;border-radius:9px;padding:0 6px;font-size:10px;font-weight:700}
+.fam tr.sub .addr{font-weight:500;padding-left:22px}
+.fam tr.stale{opacity:.5}

@@ -1,0 +1,148 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AgentHub — agents</title>
+<link rel="stylesheet" href="hub.css">
+<header>
+  <h1>Agent<span>Hub</span></h1>
+  <nav><a href="/board">Board</a><a href="/agents" class="on">Agents</a><a href="/">Chat</a><a href="/rules">Rules</a></nav>
+  <span class="grow"></span>
+  <button id="idbtn" class="ghost" title="Set your address and token">identity</button>
+</header>
+
+<section id="idbar" hidden>
+  <label>as <input id="me" placeholder="human@hub" autocomplete="off"></label>
+  <label>token <input id="tok" type="password" placeholder="(blank if open)" autocomplete="off"></label>
+  <button id="save">save</button>
+  <span class="hint">Stored in this browser only.</span>
+</section>
+
+<section id="bar">
+  <input id="filter" placeholder="filter by address, label, title or folder…" autocomplete="off">
+  <label class="chk"><input type="checkbox" id="all"> show ended and idle</label>
+  <span class="hint" id="summary"></span>
+</section>
+
+<main id="agents"></main>
+
+<script src="hub.js"></script>
+<script>
+const IDLE_HOURS = 24;   // away this long (or ended): hidden unless "show ended and idle"
+let agents = [];
+
+function ago(ts){
+  if (!ts) return '';
+  const s = Math.max(0, (Date.now() - Date.parse(ts)) / 1000);
+  if (s < 60) return 'just now';
+  if (s < 3600) return Math.floor(s / 60) + 'm ago';
+  if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+  return Math.floor(s / 86400) + 'd ago';
+}
+
+function stale(a){
+  return a.session_state === 'ended' ||
+         (a.state === 'away' && Date.now() - Date.parse(a.last_seen) > IDLE_HOURS * 3600e3);
+}
+
+function row(a, sub){
+  const name = a.role ? '/' + a.role : a.address;
+  const title = a.title || (a.spawned_for ? 'started for #' + a.spawned_for : '');
+  return '<tr class="' + (stale(a) ? 'stale' : '') + (sub ? ' sub' : '') + '">' +
+    '<td>' + stateDot(a.state) + '</td>' +
+    '<td class="addr" title="' + escapeHtml(a.address) + '">' + (sub ? '↳ ' : '') + escapeHtml(name) +
+      (a.label ? ' <span class="topic">' + escapeHtml(a.label) + '</span>' : '') +
+      (a.session_state && a.session_state !== 'live' ? ' <span class="badge">' + escapeHtml(a.session_state) + '</span>' : '') +
+    '</td>' +
+    '<td class="ttl">' + escapeHtml(title) + '</td>' +
+    '<td class="cwd" title="' + escapeHtml(a.cwd) + '">' + escapeHtml(a.cwd) +
+      (a.company ? ' <span class="co">' + escapeHtml(a.company) + '</span>' : '') + '</td>' +
+    '<td class="ev">' + escapeHtml(a.last_event || '') + '</td>' +
+    '<td class="seen" title="' + escapeHtml(a.last_seen) + '">' + ago(a.last_seen) + '</td>' +
+    '<td class="un">' + (a.unread ? '<span class="u">' + a.unread + '</span>' : '') + '</td>' +
+    '</tr>';
+}
+
+function paint(){
+  const showAll = document.getElementById('all').checked;
+  const q = document.getElementById('filter').value.trim().toLowerCase();
+  const match = a => !q || [a.address, a.label, a.title, a.cwd, a.company].some(v => (v || '').toLowerCase().includes(q));
+
+  // Families (vendor@host), grouped by machine.
+  const fams = new Map();
+  agents.forEach(a => {
+    if (!fams.has(a.family)) fams.set(a.family, { host: a.host, vendor: a.vendor, bridge: null, rows: [] });
+    const f = fams.get(a.family);
+    if (a.role === 'bridge') f.bridge = a;
+    else f.rows.push(a);
+  });
+
+  let shown = 0, hidden = 0, live = 0;
+  const hosts = new Map();
+  [...fams.keys()].sort().forEach(k => {
+    const f = fams.get(k);
+    if (!hosts.has(f.host)) hosts.set(f.host, []);
+    hosts.get(f.host).push([k, f]);
+  });
+
+  const html = [];
+  [...hosts.keys()].sort().forEach(host => {
+    const cards = [];
+    hosts.get(host).forEach(([fam, f]) => {
+      // Subagents sit under their parent; everything else by most recently seen.
+      const byParent = new Map();
+      const tops = [];
+      f.rows.forEach(a => {
+        if (a.parent && f.rows.some(p => p.address === a.parent)) {
+          if (!byParent.has(a.parent)) byParent.set(a.parent, []);
+          byParent.get(a.parent).push(a);
+        } else tops.push(a);
+      });
+      tops.sort((x, y) => (y.last_seen || '').localeCompare(x.last_seen || ''));
+      const rows = [];
+      let famLive = 0, famHidden = 0;
+      tops.forEach(a => {
+        const kids = byParent.get(a.address) || [];
+        [a, ...kids].forEach((r, i) => {
+          if (r.state !== 'away') famLive++;
+          // A bare family address (no session) only shows with "show ended and idle".
+          const hide = !showAll && (stale(r) || (!r.role && r.kind !== 'session'));
+          if (hide || !match(r)) { if (hide) famHidden++; return; }
+          rows.push(row(r, i > 0));
+        });
+      });
+      shown += rows.length; hidden += famHidden; live += famLive;
+      if (!rows.length && (q || !showAll) && !(f.bridge && !q)) return;
+      const b = f.bridge;
+      cards.push('<section class="fam">' +
+        '<h3>' + escapeHtml(fam) +
+        (b ? '<span class="br" title="wake bridge, last seen ' + escapeHtml(b.last_seen) + '">' + stateDot(b.state) + 'bridge</span>'
+           : '<span class="br none">no bridge</span>') +
+        '<span class="cnt">' + famLive + ' live' + (famHidden ? ' · ' + famHidden + ' hidden' : '') + '</span></h3>' +
+        (rows.length
+          ? '<table><thead><tr><th></th><th>Session</th><th>Working on</th><th>Folder</th><th>Last event</th><th>Seen</th><th></th></tr></thead><tbody>' +
+            rows.join('') + '</tbody></table>'
+          : '<div class="empty">no active sessions</div>') +
+        '</section>');
+    });
+    if (cards.length) html.push('<div class="host"><h2>@' + escapeHtml(host) + '</h2>' + cards.join('') + '</div>');
+  });
+
+  document.getElementById('agents').innerHTML = html.join('') || '<div class="empty">no agents match</div>';
+  document.getElementById('summary').textContent =
+    live + ' live · ' + shown + ' shown' + (hidden ? ' · ' + hidden + ' ended or idle hidden' : '');
+}
+
+async function load(){
+  try { agents = (await api('/api/who')).agents || []; paint(); } catch { /* hub restarting */ }
+}
+
+document.getElementById('filter').addEventListener('input', paint);
+document.getElementById('all').addEventListener('change', () => {
+  try { localStorage.setItem('hub.agents.all', document.getElementById('all').checked ? '1' : ''); } catch {}
+  paint();
+});
+try { document.getElementById('all').checked = localStorage.getItem('hub.agents.all') === '1'; } catch {}
+subscribe(ev => { if (ev.type === 'message' || ev.type === 'task') load(); });
+load();
+setInterval(load, 10000);
+</script>

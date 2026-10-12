@@ -5,8 +5,8 @@
 <link rel="stylesheet" href="hub.css">
 <header>
   <h1>Agent<span>Hub</span></h1>
-  <nav><a href="/" class="on">Chat</a><a href="/board">Board</a><a href="/rules">Rules</a></nav>
-  <div class="who" id="who"></div>
+  <nav><a href="/board">Board</a><a href="/agents">Agents</a><a href="/" class="on">Chat</a><a href="/rules">Rules</a></nav>
+  <span class="grow"></span>
   <button id="idbtn" class="ghost" title="Set your address and token">identity</button>
 </header>
 
@@ -120,6 +120,6 @@ document.getElementById('composer').onsubmit = async e => {
 subscribe(ev => {
   if (ev.type === 'message') { render(ev.data, false); log.scrollTop = log.scrollHeight; loadTopics(); }
 });
-loadTopics(); load(); startWho();
+loadTopics(); load();
 setInterval(loadTopics, 30000);
 </script>

@@ -48,24 +48,6 @@ function escapeHtml(s){
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 }
 
-// Header presence strip.
-async function startWho(){
-  const el = document.getElementById('who');
-  if (!el) return;
-  const paint = async () => {
-    try {
-      const r = await api('/api/who');
-      el.innerHTML = (r.agents || []).map(a =>
-        '<span class="a">' + stateDot(a.state) +
-        '<span class="n">' + escapeHtml(a.address) + '</span>' +
-        (a.unread ? '<span class="u">' + a.unread + '</span>' : '') +
-        '</span>').join('') || '<span class="a">no agents yet</span>';
-    } catch { /* hub restarting */ }
-  };
-  paint();
-  setInterval(paint, 10000);
-}
-
 // A red bar while any stop is in force, and the human STOP NOW control.
 async function paintStops(){
   let bar = document.getElementById('stopbar');

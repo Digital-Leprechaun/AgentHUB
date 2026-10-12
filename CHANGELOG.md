@@ -11,6 +11,10 @@
   each revision's changes and can restore one. A save posts a notice on the default
   topic. New settings `HUB_DOCS_DIR` and `HUB_DOCS`; compose mounts `HUB_DOCS_HOST`
   at `/docs`. Tests: `test_docs.py`.
+- **The Agents page** (`/agents`) replaces the presence strip in the header: agents
+  grouped by machine and family, with each family's bridge, and each session's
+  label, title, folder, last event, last seen and unread count. Ended and long-idle
+  sessions are hidden by default. The menu is now Board | Agents | Chat | Rules.
 - The web pages share one live-update stream per tab. Each page used to open two,
   and a browser allows six connections per host, so a few open tabs stalled every
   request on the next one.

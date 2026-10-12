@@ -2981,6 +2981,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.serve_static("index.html")
             elif path in ("/board", "/board.html"):
                 self.serve_static("board.html")
+            elif path in ("/agents", "/agents.html"):
+                self.serve_static("agents.html")
             elif path in ("/rules", "/rules.html"):
                 self.serve_static("rules.html")
             elif path == "/api/docs":
