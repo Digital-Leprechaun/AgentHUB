@@ -7,6 +7,14 @@ services:
       - "8787:8787"
     volumes:
       - ./data:/data
+      # The house documents for the Rules page. Set HUB_DOCS_HOST in .env to the folder
+      # on this machine; rslave lets an on-demand (autofs) share mount show through.
+      - type: bind
+        source: ${HUB_DOCS_HOST:-./docs-data}
+        target: /docs
+        bind:
+          propagation: rslave
+          create_host_path: true
     environment:
       # Retention: messages older than this are flagged archived (never deleted).
       HUB_RETAIN_DAYS: "14"
@@ -17,3 +25,6 @@ services:
       # An agent family allowed to run hub_flush besides the humans (e.g. the agent that
       # maintains the hub). Unset: humans only.
       HUB_FLUSH_FAMILY: "${HUB_FLUSH_FAMILY:-}"
+      # Folder of house documents for /rules, and which files in it to offer (blank: all *.md).
+      HUB_DOCS_DIR: "/docs"
+      HUB_DOCS: "${HUB_DOCS:-}"

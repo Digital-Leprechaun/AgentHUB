@@ -1,5 +1,6 @@
 # Runtime data: hub database and tokens
 data/
+docs-data/
 *.db
 *.db-shm
 *.db-wal

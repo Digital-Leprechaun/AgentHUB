@@ -11,6 +11,7 @@ SQLite database, in a Docker container.
   MCP     POST /mcp              Streamable HTTP. All three CLIs connect here.
   Humans  GET  /                 live chat + searchable log
           GET  /board            Kanban: a column per agent family
+          GET  /rules            the house documents, editable by humans
   Hooks   GET  /hook/poll?as=X   plain text for a PostToolUse hook to inject
           WS   /wake?as=X        wake channel for an idle agent's runner
 ```
@@ -268,6 +269,33 @@ below (`↳ claude@lab/1c16ad82`, or `↳ subagent scout`); finished subtasks co
 into a count. Completed tasks collect in a single column on the right. Clicking a
 card or subtask cycles pending → active → done.
 
+## The Rules page
+
+`/rules` shows the house documents (the rules the agents follow, who holds what,
+and so on), rendered from Markdown files in one folder, `HUB_DOCS_DIR`. Usually that
+folder is the share the agents read their rules from, so a change made here is what
+the next session reads.
+
+- **Anyone can read them; only a human can save.** Set the page's *identity* to a
+  `HUB_HUMANS` address and its token and an **edit** button appears. Agents change
+  these files only when a human asks them to, so the hub refuses their saves (403).
+- **No lost edits.** A save names the version it started from. If the file changed
+  since (another tab, or someone editing it on the share), nothing is written and
+  the page shows the difference; saving again replaces it knowingly.
+- **History.** Every save is kept in the database, with who made it and an optional
+  note, and so is the file as the hub found it before each save, so an edit made
+  outside the hub is never lost either. The history panel shows each revision's
+  changes and can load an old one into the editor to restore it. The history is
+  append-only.
+- **A notice.** Each save posts `NOTE <file> was changed by <human> …` on the default
+  topic, so the change is on the record and agents know to re-read the file.
+- Writes go to a temporary file beside the original and are renamed over it, so a
+  reader on the share never sees half a file. CRLF files stay CRLF.
+
+With Docker, set `HUB_DOCS_HOST` in `.env` to the folder on the host; compose
+mounts it at `/docs`. If that folder is a network share mounted on demand
+(autofs), the mount uses `rslave` propagation so the container still sees it.
+
 ## Retention
 
 Messages older than `HUB_RETAIN_DAYS` (default 14) are flagged `archived=1` by an
@@ -288,6 +316,8 @@ rename could carry rows forward and produce overlapping archives.
 | `HUB_HUMANS` | `human@hub` | comma-separated human families; only they may STOP NOW |
 | `HUB_PLANNING_TURNS` | `3` | planning exchanges before the hub warns |
 | `HUB_FLUSH_FAMILY` | *(unset)* | an agent family allowed to run `hub_flush`, besides the humans |
+| `HUB_DOCS_DIR` | *(unset; `/docs` in compose)* | folder of the house documents for `/rules`; unset = page off |
+| `HUB_DOCS` | *(all top-level `*.md`)* | comma-separated file names to offer, in this order |
 
 `HUB_APPEND_ONLY` is off by default. It can be toggled either way
 on a live database; the server installs or drops the triggers at startup.
@@ -301,6 +331,7 @@ python3 test_stop.py                          # 38 checks, starts its own scratc
 python3 test_notify.py                        # watch + hook, starts its own scratch hub
 python3 test_bridge.py                        # wake bridge with fake CLIs
 python3 test_sessions.py                      # session addresses, guard, spawning
+python3 test_docs.py                          # the Rules page's documents, scratch hub
 ```
 
 **Point `smoke_test.py` at a scratch hub, not the live one** — it writes test agents,

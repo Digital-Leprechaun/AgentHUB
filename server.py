@@ -67,7 +67,7 @@ MAX_BODY = 32000
 MAX_WAIT = 60
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_NAME = "agenthub"
-SERVER_VERSION = "3.0.0"
+SERVER_VERSION = "3.1.0"
 
 # A family-addressed request (claude@desk, anyone@desk) that no bridge claims within
 # this long is escalated to the humans and the sender.
@@ -78,6 +78,13 @@ HUB_SENDER = "agenthub@hub"  # the hub's own voice, for escalations
 # Besides the humans, one agent family may flush the queue (HUB_FLUSH_FAMILY, e.g. the
 # agent that maintains the hub); unset means humans only.
 FLUSH_FAMILY = os.environ.get("HUB_FLUSH_FAMILY", "").lower()
+# House documents (the rules agents follow, who holds what) that the humans edit from
+# the Rules page. HUB_DOCS_DIR is the folder they live in (unset: the page is off);
+# HUB_DOCS limits editing to the files named, else every top-level *.md there.
+DOCS_DIR = os.environ.get("HUB_DOCS_DIR", "")
+DOCS_ONLY = [d.strip() for d in os.environ.get("HUB_DOCS", "").split(",") if d.strip()]
+DOC_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\.md$")
+MAX_DOC = 256 * 1024
 
 ADDR_RE = re.compile(r"^([a-z0-9][a-z0-9._-]{0,31})@([a-z0-9][a-z0-9._-]{0,31})(?:/([a-z0-9][a-z0-9._/-]{0,63}))?$", re.I)
 TOPIC_RE = re.compile(r"^[a-z0-9][a-z0-9._/-]{0,63}$", re.I)
@@ -110,6 +117,20 @@ def log(msg: str) -> None:
 
 class HubError(Exception):
     """A user-facing error; the message is safe to return to the agent."""
+    status = 400
+
+
+class HubForbidden(HubError):
+    status = 403
+
+
+class HubConflict(HubError):
+    """A save based on a version of a document that is no longer the current one."""
+    status = 409
+
+    def __init__(self, msg: str, current: dict):
+        super().__init__(msg)
+        self.current = current
 
 
 # ----------------------------------------------------------------------------
@@ -297,6 +318,25 @@ CREATE TABLE IF NOT EXISTS requests(
 );
 CREATE INDEX IF NOT EXISTS ix_req_state ON requests(state, target);
 CREATE INDEX IF NOT EXISTS ix_req_claim ON requests(claimed_by, msg_id);
+
+-- Every version of a house document the hub has seen: each save from the Rules page,
+-- and the file as it stood before (author '(file)') when it was changed some other way.
+CREATE TABLE IF NOT EXISTS doc_revisions(
+  id     INTEGER PRIMARY KEY AUTOINCREMENT,
+  name   TEXT NOT NULL,
+  ts     TEXT NOT NULL,
+  author TEXT NOT NULL,
+  sha    TEXT NOT NULL,
+  note   TEXT NOT NULL DEFAULT '',
+  text   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_docrev_name ON doc_revisions(name, id);
+CREATE TRIGGER IF NOT EXISTS doc_revisions_no_delete
+BEFORE DELETE ON doc_revisions
+BEGIN SELECT RAISE(ABORT, 'document history is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS doc_revisions_no_update
+BEFORE UPDATE ON doc_revisions
+BEGIN SELECT RAISE(ABORT, 'document history is append-only'); END;
 """
 
 # Installed only when HUB_APPEND_ONLY=1, and dropped again when it is off, so the
@@ -1433,6 +1473,32 @@ class Store:
         return [dict(r) for r in self.q("SELECT * FROM requests WHERE msg_id=?", (int(msg_id),))]
 
     # -- retention ----------------------------------------------------------
+    # -- house documents ----------------------------------------------------
+    def doc_revisions(self, name: str) -> list[dict]:
+        return [dict(r) for r in self.q(
+            "SELECT id, name, ts, author, sha, note, LENGTH(text) AS size FROM doc_revisions"
+            " WHERE name=? ORDER BY id DESC", (name,))]
+
+    def doc_revision(self, rid: int) -> dict:
+        r = self.one("SELECT * FROM doc_revisions WHERE id=?", (rid,))
+        if not r:
+            raise HubError(f"no document revision {rid}")
+        return dict(r)
+
+    def doc_record(self, name: str, author: str, doc: dict, note: str = "") -> int:
+        """Keep `doc` (as read from or written to disk) as a revision of `name`, unless it
+        is already the latest one. Returns the latest revision's id."""
+        with self.lock:
+            last = self.db.execute("SELECT id, sha FROM doc_revisions WHERE name=?"
+                                   " ORDER BY id DESC LIMIT 1", (name,)).fetchone()
+            if last and last["sha"] == doc["sha"]:
+                return last["id"]
+            cur = self.db.execute(
+                "INSERT INTO doc_revisions(name, ts, author, sha, note, text) VALUES(?,?,?,?,?,?)",
+                (name, now_iso(), author, doc["sha"], note, doc["text"]))
+            self.db.commit()
+            return cur.lastrowid
+
     def sweep(self) -> int:
         cutoff = datetime.now(timezone.utc).timestamp() - RETAIN_DAYS * 86400
         cut_iso = datetime.fromtimestamp(cutoff, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1450,6 +1516,70 @@ class Store:
 # ----------------------------------------------------------------------------
 # tokens
 # ----------------------------------------------------------------------------
+class Docs:
+    """The house documents: Markdown files in one folder, read and written whole.
+
+    The folder is usually a share the agents read their rules from, so a save goes
+    through a temporary file and a rename and never leaves a half-written file."""
+
+    def __init__(self, folder: str, only: list[str]):
+        self.folder = folder
+        self.only = only
+        self.lock = threading.Lock()   # one save at a time: compare, then write
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.folder)
+
+    def names(self) -> list[str]:
+        if not self.folder:
+            return []
+        try:
+            found = {f for f in os.listdir(self.folder)
+                     if DOC_NAME_RE.match(f) and os.path.isfile(os.path.join(self.folder, f))}
+        except OSError as e:
+            raise HubError(f"the documents folder cannot be read: {e.strerror or e}")
+        if self.only:
+            return [n for n in self.only if n in found]
+        return sorted(found, key=str.lower)
+
+    def _path(self, name: str) -> str:
+        if not DOC_NAME_RE.match(name or "") or name not in self.names():
+            raise HubError(f"no editable document {name!r}")
+        return os.path.join(self.folder, name)
+
+    @staticmethod
+    def _doc(name: str, data: bytes, mtime: float) -> dict:
+        return {"name": name, "text": data.decode("utf-8", errors="replace"),
+                "sha": hashlib.sha256(data).hexdigest(), "size": len(data),
+                "mtime": datetime.fromtimestamp(mtime, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+
+    def read(self, name: str) -> dict:
+        path = self._path(name)
+        with open(path, "rb") as fh:
+            data = fh.read()
+        return self._doc(name, data, os.stat(path).st_mtime)
+
+    def write(self, name: str, text: str, old: dict) -> dict:
+        """Replace `name` with `text`, keeping the file's line endings and final newline."""
+        path = self._path(name)
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        if text and not text.endswith("\n"):
+            text += "\n"
+        if "\r\n" in old["text"]:
+            text = text.replace("\n", "\r\n")
+        data = text.encode("utf-8")
+        if len(data) > MAX_DOC:
+            raise HubError(f"{name} would be {len(data)} bytes; the limit is {MAX_DOC}")
+        tmp = path + ".hub-saving"
+        with open(tmp, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        return self._doc(name, data, os.stat(path).st_mtime)
+
+
 class Tokens:
     """Family tokens: {"claude@desk": "secret", ...}.
 
@@ -2385,6 +2515,40 @@ class Hub:
     def t_hub_stops(self, args: dict, token: str | None) -> dict:
         return {"stops": self.store.stops_active()}
 
+    # -- house documents (the Rules page) ------------------------------------
+    def doc_save(self, args: dict, token: str | None) -> dict:
+        """A human replaces a house document. `base_sha` is the version the edit started
+        from; if the file has changed since, nothing is written and the caller gets the
+        current version back to merge with."""
+        me = Addr.parse(args.get("as", ""))
+        if not self.is_human(me, token):
+            raise HubForbidden(f"only a human ({', '.join(sorted(HUMANS))}) may change the house documents")
+        name = args.get("name") or ""
+        text = args.get("text")
+        base = args.get("base_sha") or ""
+        if not isinstance(text, str) or not text.strip():
+            raise HubError("the document may not be empty")
+        note = norm_title(args.get("note"))
+        with DOCS.lock:
+            cur = DOCS.read(name)
+            if base != cur["sha"]:
+                raise HubConflict(f"{name} changed after you opened it; your edit was not saved", cur)
+            if text.replace("\r\n", "\n").rstrip("\n") == cur["text"].replace("\r\n", "\n").rstrip("\n"):
+                return {"doc": cur, "unchanged": True}
+            # The version being replaced goes into the history first, in case it was
+            # written some other way since the hub last saw it.
+            self.store.doc_record(name, "(file)", cur)
+            new = DOCS.write(name, text, cur)
+            rev = self.store.doc_record(name, str(me), new, note)
+        log(f"{name} saved by {me} as revision {rev}")
+        verified = self.tokens.enforced and self.tokens.verify(me, token)
+        msg = self.store.post(
+            me, f"NOTE {name} was changed by {me} (revision {rev})" + (f": {note}" if note else "")
+                + f". Re-read {name} before you start new work.", [], "", None, verified)
+        self._notify(msg)
+        self.watchers.push("doc", {"name": name, "sha": new["sha"], "revision": rev, "by": str(me)})
+        return {"doc": new, "revision": rev, "posted": msg["id"]}
+
     def _push_stop(self, s: dict, kind: str) -> None:
         self.watchers.push(kind, s)
         for addr in self.wakers.addresses():
@@ -2399,6 +2563,7 @@ STORE: Store
 TOKENS: Tokens
 WAKERS = Wakers()
 WATCHERS = Watchers()
+DOCS = Docs(DOCS_DIR, DOCS_ONLY)
 HUB: Hub
 
 
@@ -2734,6 +2899,26 @@ class Handler(BaseHTTPRequestHandler):
             raise HubError("only a bridge (vendor@host/bridge) may claim requests")
         return me
 
+    def serve_docs(self, args: dict) -> None:
+        """The house documents, and whether the caller (`as`, with its token) may edit them."""
+        if not DOCS.enabled:
+            self.send_json({"enabled": False, "docs": []})
+            return
+        can_edit = False
+        if args.get("as"):
+            try:
+                can_edit = HUB.is_human(Addr.parse(args["as"]), self.token())
+            except HubError:
+                pass
+        docs = []
+        for name in DOCS.names():
+            d = DOCS.read(name)
+            # The hub keeps the version it first sees, so history starts before the first save.
+            STORE.doc_record(name, "(file)", d)
+            docs.append({k: d[k] for k in ("name", "sha", "size", "mtime")})
+        self.send_json({"enabled": True, "docs": docs, "can_edit": can_edit,
+                        "humans": sorted(HUMANS)})
+
     # -- static -------------------------------------------------------------
     def serve_static(self, name: str) -> None:
         safe = os.path.normpath(name).lstrip("/\\").replace("\\", "/")
@@ -2796,10 +2981,24 @@ class Handler(BaseHTTPRequestHandler):
                 self.serve_static("index.html")
             elif path in ("/board", "/board.html"):
                 self.serve_static("board.html")
+            elif path in ("/rules", "/rules.html"):
+                self.serve_static("rules.html")
+            elif path == "/api/docs":
+                self.serve_docs(args)
+            elif path == "/api/doc":
+                self.send_json({"doc": DOCS.read(args.get("name", ""))})
+            elif path == "/api/doc/history":
+                name = args.get("name", "")
+                DOCS._path(name)  # only documents that are still editable
+                self.send_json({"revisions": STORE.doc_revisions(name)})
+            elif path == "/api/doc/revision":
+                self.send_json({"revision": STORE.doc_revision(int(args.get("id") or 0))})
             else:
                 self.serve_static(path)
+        except HubConflict as e:
+            self.send_json({"error": str(e), "current": e.current}, e.status)
         except HubError as e:
-            self.send_json({"error": str(e)}, 400)
+            self.send_json({"error": str(e)}, e.status)
         except BrokenPipeError:
             pass
         except Exception as e:  # noqa: BLE001
@@ -2829,6 +3028,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(HUB.call("hub_stop", body, self.token()))
             elif path == "/api/resume":
                 self.send_json(HUB.call("hub_resume", body, self.token()))
+            elif path == "/api/doc":
+                self.send_json(HUB.doc_save(body, self.token()))
             elif path == "/api/claim":
                 me = self.bridge_call(body)
                 session = STORE.claim(me, int(body["msg_id"]), body.get("target", ""),
@@ -2855,8 +3056,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"moved": moved})
             else:
                 self.send_json({"error": "not found"}, 404)
+        except HubConflict as e:
+            self.send_json({"error": str(e), "current": e.current}, e.status)
         except HubError as e:
-            self.send_json({"error": str(e)}, 400)
+            self.send_json({"error": str(e)}, e.status)
         except BrokenPipeError:
             pass
         except Exception as e:  # noqa: BLE001
@@ -2906,6 +3109,8 @@ def main() -> None:
     log(f"  MCP    POST http://<host>:{PORT}/mcp")
     log(f"  board  GET  http://<host>:{PORT}/board")
     log(f"  chat   GET  http://<host>:{PORT}/")
+    if DOCS.enabled:
+        log(f"  rules  GET  http://<host>:{PORT}/rules  docs={DOCS_DIR}")
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     srv.daemon_threads = True
     try:

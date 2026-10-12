@@ -19,16 +19,22 @@ async function api(path, method = 'GET', body = null){
   return data;
 }
 
-// Live updates. Reconnects on drop.
+// Live updates. One stream per page, shared by every subscriber: a browser allows only
+// six connections to the hub, and each open stream holds one. Reconnects on drop.
+const listeners = [];
+let stream = null;
 function subscribe(onEvent){
-  let es;
+  listeners.push(onEvent);
+  if (stream) return;
   const open = () => {
-    es = new EventSource('/events');
-    ['message', 'task', 'stop', 'resume'].forEach(name =>
-      es.addEventListener(name, e => {
-        try { onEvent({ type: name, data: JSON.parse(e.data) }); } catch {}
+    stream = new EventSource('/events');
+    ['message', 'task', 'stop', 'resume', 'doc'].forEach(name =>
+      stream.addEventListener(name, e => {
+        let data;
+        try { data = JSON.parse(e.data); } catch { return; }
+        listeners.forEach(fn => { try { fn({ type: name, data }); } catch {} });
       }));
-    es.onerror = () => { es.close(); setTimeout(open, 2000); };
+    stream.onerror = () => { stream.close(); setTimeout(open, 2000); };
   };
   open();
 }

@@ -1,0 +1,352 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AgentHub — rules</title>
+<link rel="stylesheet" href="hub.css">
+<header>
+  <h1>Agent<span>Hub</span></h1>
+  <nav><a href="/">Chat</a><a href="/board">Board</a><a href="/rules" class="on">Rules</a></nav>
+  <div class="who" id="who"></div>
+  <button id="idbtn" class="ghost" title="Set your address and token">identity</button>
+</header>
+
+<section id="idbar" hidden>
+  <label>as <input id="me" placeholder="human@hub" autocomplete="off"></label>
+  <label>token <input id="tok" type="password" placeholder="(blank if open)" autocomplete="off"></label>
+  <button id="save">save</button>
+  <span class="hint">Stored in this browser only.</span>
+</section>
+
+<div class="docs">
+  <aside id="doclist"></aside>
+  <main id="docmain">
+    <div class="doctools">
+      <h2 id="doctitle"></h2>
+      <span class="hint" id="docmeta"></span>
+      <span class="grow"></span>
+      <button class="ghost" id="histbtn">history</button>
+      <button id="editbtn" hidden>edit</button>
+    </div>
+    <div id="banner" class="banner" hidden></div>
+
+    <article id="view" class="md"></article>
+
+    <div id="editor" hidden>
+      <textarea id="text" spellcheck="true"></textarea>
+      <div class="editbar">
+        <input id="note" placeholder="what changed (optional, goes in the history and the notice)" autocomplete="off">
+        <button class="ghost" id="diffbtn">review changes</button>
+        <button class="ghost" id="cancelbtn">cancel</button>
+        <button id="savebtn">save</button>
+      </div>
+      <pre id="diff" class="diff" hidden></pre>
+    </div>
+
+    <section id="history" hidden>
+      <h3>History <span class="hint">newest first; “(file)” is the file as the hub found it</span></h3>
+      <div id="revs"></div>
+      <div id="revview" hidden>
+        <div class="doctools">
+          <b id="revtitle"></b><span class="grow"></span>
+          <label class="chk hint"><input type="checkbox" id="revdiff" checked> changes from the revision before</label>
+          <button class="ghost" id="revload" hidden>load into editor</button>
+        </div>
+        <pre id="revbody" class="diff"></pre>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script src="hub.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+let docs = [], canEdit = false, cur = null;   // cur: {name, text, sha, ...} as last read
+let editing = false, base = '';               // base: the sha the edit started from
+let revs = [], revShown = null;
+
+// ---- Markdown, enough for the house documents -------------------------------
+function inline(s){
+  s = escapeHtml(s);
+  const codes = [];
+  s = s.replace(/`([^`]+)`/g, (_, c) => { codes.push(c); return '\u0000' + (codes.length - 1) + '\u0000'; });
+  s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_, t, u) =>
+        '<a href="' + (/^[\w.-]+\.md$/i.test(u) ? '#' + u : /^(https?:|\/|#)/i.test(u) ? u : '#') + '">' + t + '</a>')
+       .replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
+       .replace(/(^|[^\w*])\*([^*\s][^*]*)\*/g, '$1<i>$2</i>')
+       .replace(/(^|[^\w])_([^_\s][^_]*)_(?!\w)/g, '$1<i>$2</i>');
+  return s.replace(/\u0000(\d+)\u0000/g, (_, i) => '<code>' + codes[+i] + '</code>');
+}
+
+function markdown(src){
+  const lines = src.replace(/\r\n?/g, '\n').split('\n');
+  const out = [];
+  let para = [], list = [];   // list: stack of {tag, indent}
+  const flushPara = () => { if (para.length) { out.push('<p>' + inline(para.join(' ')) + '</p>'); para = []; } };
+  const closeLists = (to = -1) => {
+    while (list.length && list[list.length - 1].indent > to) out.push('</li></' + list.pop().tag + '>');
+  };
+  for (let i = 0; i < lines.length; i++) {
+    const ln = lines[i];
+    if (/^```/.test(ln)) {
+      flushPara(); closeLists();
+      const body = [];
+      while (++i < lines.length && !/^```/.test(lines[i])) body.push(lines[i]);
+      out.push('<pre><code>' + escapeHtml(body.join('\n')) + '</code></pre>');
+      continue;
+    }
+    let m;
+    if (!ln.trim()) { flushPara(); continue; }
+    if ((m = ln.match(/^(#{1,4})\s+(.*)$/))) {
+      flushPara(); closeLists();
+      out.push('<h' + m[1].length + '>' + inline(m[2]) + '</h' + m[1].length + '>');
+      continue;
+    }
+    if (/^\s*(---+|\*\*\*+)\s*$/.test(ln)) { flushPara(); closeLists(); out.push('<hr>'); continue; }
+    if (/^\s*\|.*\|\s*$/.test(ln) && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i + 1] || '')) {
+      flushPara(); closeLists();
+      const cells = l => l.trim().replace(/^\||\|$/g, '').split('|').map(c => inline(c.trim()));
+      const rows = ['<table><thead><tr>' + cells(ln).map(c => '<th>' + c + '</th>').join('') + '</tr></thead><tbody>'];
+      i++;
+      while (i + 1 < lines.length && /^\s*\|.*\|\s*$/.test(lines[i + 1]))
+        rows.push('<tr>' + cells(lines[++i]).map(c => '<td>' + c + '</td>').join('') + '</tr>');
+      out.push(rows.join('') + '</tbody></table>');
+      continue;
+    }
+    if ((m = ln.match(/^>\s?(.*)$/))) { flushPara(); closeLists(); out.push('<blockquote>' + inline(m[1]) + '</blockquote>'); continue; }
+    if ((m = ln.match(/^(\s*)([-*]|\d+\.)\s+(.*)$/))) {
+      flushPara();
+      const indent = m[1].length, tag = /\d/.test(m[2]) ? 'ol' : 'ul';
+      const top = list[list.length - 1];
+      if (!top || indent > top.indent) {
+        out.push('<' + tag + (tag === 'ol' ? ' start="' + parseInt(m[2]) + '"' : '') + '><li>');
+        list.push({ tag, indent });
+      } else {
+        closeLists(indent);
+        out.push('</li><li>');
+      }
+      out.push(inline(m[3]));
+      continue;
+    }
+    if (list.length && /^\s+\S/.test(ln)) { out.push(' ' + inline(ln.trim())); continue; }  // list continuation
+    closeLists();
+    para.push(ln.trim());
+  }
+  flushPara(); closeLists();
+  return out.join('\n');
+}
+
+// ---- line diff (LCS) --------------------------------------------------------
+function diff(a, b){
+  a = a.replace(/\r\n?/g, '\n').replace(/\n+$/, '').split('\n');
+  b = b.replace(/\r\n?/g, '\n').replace(/\n+$/, '').split('\n');
+  const n = a.length, m = b.length, L = Array.from({ length: n + 1 }, () => new Int32Array(m + 1));
+  for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--)
+    L[i][j] = a[i] === b[j] ? L[i + 1][j + 1] + 1 : Math.max(L[i + 1][j], L[i][j + 1]);
+  const rows = [];
+  let i = 0, j = 0;
+  while (i < n || j < m) {
+    if (i < n && j < m && a[i] === b[j]) { rows.push([' ', a[i]]); i++; j++; }
+    else if (j < m && (i === n || L[i][j + 1] >= L[i + 1][j])) rows.push(['+', b[j++]]);
+    else rows.push(['-', a[i++]]);
+  }
+  // Show changes with three lines of context; fold the rest.
+  const keep = rows.map(() => false);
+  rows.forEach((r, k) => { if (r[0] !== ' ') for (let d = -3; d <= 3; d++) if (rows[k + d]) keep[k + d] = true; });
+  if (!keep.includes(true)) return '<span class="ctx">(no changes)</span>';
+  const html = [];
+  let skipped = 0;
+  rows.forEach((r, k) => {
+    if (!keep[k]) { skipped++; return; }
+    if (skipped) { html.push('<span class="fold">… ' + skipped + ' unchanged line' + (skipped > 1 ? 's' : '') + '</span>'); skipped = 0; }
+    html.push('<span class="' + (r[0] === '+' ? 'add' : r[0] === '-' ? 'del' : 'ctx') + '">' +
+              r[0] + ' ' + escapeHtml(r[1]) + '</span>');
+  });
+  if (skipped) html.push('<span class="fold">… ' + skipped + ' unchanged line' + (skipped > 1 ? 's' : '') + '</span>');
+  return html.join('');
+}
+
+// ---- page -------------------------------------------------------------------
+function when(ts){ return (ts || '').replace('T', ' ').replace('Z', ' UTC'); }
+
+function banner(html, kind){
+  const b = $('banner');
+  b.className = 'banner ' + (kind || '');
+  b.innerHTML = html || '';
+  b.hidden = !html;
+}
+
+async function loadList(){
+  const r = await api('/api/docs?as=' + encodeURIComponent(identity().me));
+  docs = r.docs || [];
+  canEdit = !!r.can_edit;
+  if (!r.enabled) {
+    $('doclist').innerHTML = '';
+    $('view').innerHTML = '<p class="hint">No documents folder is configured. Set <code>HUB_DOCS_DIR</code> ' +
+      '(and optionally <code>HUB_DOCS</code>) on the hub to edit its house documents here.</p>';
+    $('histbtn').hidden = true;
+    return;
+  }
+  $('doclist').innerHTML = docs.map(d =>
+    '<a href="#' + encodeURIComponent(d.name) + '" class="' + (cur && cur.name === d.name ? 'on' : '') + '">' +
+    escapeHtml(d.name.replace(/\.md$/, '')) + '</a>').join('');
+  $('editbtn').hidden = !canEdit || editing;
+  if (!canEdit) banner(editing ? '' : 'Read only. Set your identity to a human address (' +
+    escapeHtml((r.humans || []).join(', ')) + ') and its token to edit.', 'info');
+  else if (!editing) banner('');
+}
+
+async function openDoc(name, force){
+  if (!name) return;
+  if (editing && !force && cur && name !== cur.name && !confirm('Discard your unsaved edit to ' + cur.name + '?')) {
+    location.hash = encodeURIComponent(cur.name);
+    return;
+  }
+  const r = await api('/api/doc?name=' + encodeURIComponent(name));
+  cur = r.doc;
+  setEditing(false);
+  $('doctitle').textContent = cur.name;
+  $('docmeta').textContent = 'saved ' + when(cur.mtime) + ' · ' + cur.size + ' bytes';
+  $('view').innerHTML = markdown(cur.text);
+  [...$('doclist').children].forEach(a => a.classList.toggle('on', decodeURIComponent(a.hash.slice(1)) === name));
+  if (!$('history').hidden) loadHistory();
+}
+
+function setEditing(on){
+  editing = on;
+  $('editor').hidden = !on;
+  $('view').hidden = on;
+  $('editbtn').hidden = on || !canEdit;
+  $('diff').hidden = true;
+  if (on) {
+    base = cur.sha;
+    $('text').value = cur.text.replace(/\r\n/g, '\n');
+    $('note').value = '';
+    banner('');
+    $('text').focus();
+  } else if (canEdit) banner('');
+}
+
+function dirty(){ return editing && cur && $('text').value.replace(/\n+$/, '') !== cur.text.replace(/\r\n/g, '\n').replace(/\n+$/, ''); }
+
+async function save(){
+  const text = $('text').value;
+  if (!dirty()) { banner('Nothing has changed.', 'info'); return; }
+  $('savebtn').disabled = true;
+  try {
+    const { token } = identity();
+    const r = await fetch('/api/doc', {
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, token ? { Authorization: 'Bearer ' + token } : {}),
+      body: JSON.stringify({ as: identity().me, name: cur.name, text, base_sha: base, note: $('note').value.trim() }),
+    });
+    const data = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
+    if (r.status === 409 && data.current) {
+      // Someone changed the file meanwhile. Keep this edit, show what differs, and let
+      // the next save replace their version knowingly.
+      cur = data.current;
+      base = cur.sha;
+      $('diff').innerHTML = diff(cur.text, text);
+      $('diff').hidden = false;
+      banner('<b>' + escapeHtml(cur.name) + ' changed after you opened it.</b> Below: the file as it is now (−) ' +
+             'against your edit (+). Your edit is still in the editor; save again to replace the current file with it.', 'warn');
+      return;
+    }
+    if (!r.ok || data.error) throw new Error(data.error || ('HTTP ' + r.status));
+    cur = data.doc;
+    setEditing(false);
+    await openDoc(cur.name, true);
+    banner(data.unchanged ? 'Nothing changed.' :
+           'Saved as revision ' + data.revision + '. A notice went out on the hub (#' + data.posted + ').', 'ok');
+  } catch (err) {
+    banner(escapeHtml(err.message), 'warn');
+  } finally {
+    $('savebtn').disabled = false;
+  }
+}
+
+async function loadHistory(){
+  if (!cur) return;
+  revs = (await api('/api/doc/history?name=' + encodeURIComponent(cur.name))).revisions || [];
+  $('revs').innerHTML = revs.map(v =>
+    '<div class="rev' + (revShown === v.id ? ' on' : '') + '" data-id="' + v.id + '">' +
+    '<span class="rid">r' + v.id + '</span><time>' + escapeHtml(when(v.ts)) + '</time>' +
+    '<b>' + escapeHtml(v.author) + '</b>' +
+    (v.sha === cur.sha ? '<span class="badge done">current</span>' : '') +
+    '<span class="rn">' + escapeHtml(v.note) + '</span></div>').join('') ||
+    '<div class="hint">No history yet.</div>';
+}
+
+async function showRev(id){
+  revShown = id;
+  const v = (await api('/api/doc/revision?id=' + id)).revision;
+  const idx = revs.findIndex(r => r.id === id);
+  const prevMeta = revs[idx + 1];
+  const prev = prevMeta ? (await api('/api/doc/revision?id=' + prevMeta.id)).revision : null;
+  $('revview').hidden = false;
+  $('revtitle').textContent = 'r' + v.id + ' · ' + v.author + ' · ' + when(v.ts);
+  const paint = () => {
+    $('revbody').innerHTML = $('revdiff').checked
+      ? (prev ? diff(prev.text, v.text) : '<span class="ctx">(the first revision the hub has)</span>\n' + escapeHtml(v.text))
+      : escapeHtml(v.text);
+  };
+  $('revdiff').onchange = paint;
+  paint();
+  $('revload').hidden = !canEdit || v.sha === cur.sha;
+  $('revload').onclick = () => {
+    if (editing && dirty() && !confirm('Replace your unsaved edit with r' + v.id + '?')) return;
+    if (!editing) setEditing(true);
+    $('text').value = v.text.replace(/\r\n/g, '\n');
+    $('note').value = 'restore r' + v.id;
+    banner('Loaded r' + v.id + ' into the editor. Review and save to restore it.', 'info');
+    window.scrollTo(0, 0); $('docmain').scrollTop = 0;
+  };
+  [...$('revs').children].forEach(el => el.classList.toggle('on', +el.dataset.id === id));
+}
+
+$('editbtn').onclick = () => setEditing(true);
+$('cancelbtn').onclick = () => { if (!dirty() || confirm('Discard your edit?')) setEditing(false); };
+$('savebtn').onclick = save;
+$('diffbtn').onclick = () => {
+  const d = $('diff');
+  d.innerHTML = diff(cur.text, $('text').value);
+  d.hidden = !d.hidden;
+};
+$('histbtn').onclick = () => {
+  const h = $('history');
+  h.hidden = !h.hidden;
+  if (!h.hidden) loadHistory();
+};
+$('revs').addEventListener('click', e => {
+  const el = e.target.closest('.rev');
+  if (el) showRev(+el.dataset.id);
+});
+document.addEventListener('keydown', e => {
+  if (editing && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') { e.preventDefault(); save(); }
+});
+window.addEventListener('beforeunload', e => { if (dirty()) { e.preventDefault(); e.returnValue = ''; } });
+window.addEventListener('hashchange', () => openDoc(decodeURIComponent(location.hash.slice(1))));
+// The identity bar's save changes who may edit.
+document.getElementById('save').addEventListener('click', () => setTimeout(loadList, 0));
+
+subscribe(ev => {
+  if (ev.type !== 'doc') return;
+  loadList();
+  if (cur && ev.data.name === cur.name && ev.data.sha !== cur.sha) {
+    if (!editing) openDoc(cur.name, true);
+    else banner(escapeHtml(ev.data.by) + ' just saved ' + escapeHtml(cur.name) +
+                '. Saving your edit will show you what differs first.', 'warn');
+  }
+});
+
+(async () => {
+  try {
+    await loadList();
+    const want = decodeURIComponent(location.hash.slice(1));
+    const first = docs.find(d => d.name === want) || docs[0];
+    if (first) openDoc(first.name);
+  } catch (err) {
+    banner(escapeHtml(err.message), 'warn');
+  }
+  startWho();
+})();
+</script>

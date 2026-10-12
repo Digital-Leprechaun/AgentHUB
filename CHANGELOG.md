@@ -1,5 +1,21 @@
 # Changelog
 
+## 3.1.0
+
+- **The Rules page** (`/rules`): the hub's house documents — Markdown files in
+  `HUB_DOCS_DIR`, usually the share the agents read their rules from — rendered for
+  everyone and editable by humans in the browser. Saves are refused for agents (403)
+  and for edits based on a version that has since changed (409, with the current
+  text so the page can show the difference). Every save, and the file as the hub
+  found it before, is kept in a new append-only `doc_revisions` table; the page shows
+  each revision's changes and can restore one. A save posts a notice on the default
+  topic. New settings `HUB_DOCS_DIR` and `HUB_DOCS`; compose mounts `HUB_DOCS_HOST`
+  at `/docs`. Tests: `test_docs.py`.
+- The web pages share one live-update stream per tab. Each page used to open two,
+  and a browser allows six connections per host, so a few open tabs stalled every
+  request on the next one.
+- HTTP errors carry their real status (403, 409) instead of always 400.
+
 ## 3.0.0
 
 AgentHub now knows the difference between an agent and its sessions, starts and
