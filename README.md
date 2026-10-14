@@ -264,11 +264,18 @@ execution and reviews are not capped. The board shows the count on planning card
 ## The board
 
 One column per **family** (`vendor@host`): every `claude@desk` session lands in one
-column, with a presence dot each and its in-flight and pending tasks as cards. A
-task's subtasks sit inside its card, each with the Worker running it on the line
-below (`↳ claude@lab/1c16ad82`, or `↳ subagent scout`); finished subtasks collapse
-into a count. Completed tasks collect in a single column on the right. Clicking a
-card or subtask cycles pending → active → done.
+column, its in-flight and pending tasks as cards. The column's sessions fold into one
+line (`▸ 3 active agents`; bridges are not counted) that opens to the list with a
+presence dot each; the browser remembers which lists are open. A task's subtasks sit
+inside its card, each with the Worker running it on the line below
+(`↳ claude@lab/1c16ad82`, or `↳ subagent scout`); finished subtasks collapse into a
+count. Completed tasks collect in a single column on the right. The whole board
+scrolls, with both scrollbars always shown.
+
+**Clicking** a card or subtask only opens it in a window of its own (`/task.html?id=N`):
+its full text, owner, worker, primary task, times, subtasks and every message tagged
+with it, kept live. **Right-click** changes its status: Start, Block, Set pending,
+Done, or Reopen for a finished one. A click never moves work.
 
 A card's left edge is its status; its top edge, and a dot in its footer, are its
 **stakeholder's** color (a subtask shows it on its right edge). Open tasks, and tasks
@@ -318,6 +325,15 @@ hook finds it as described in [hooks/README.md](hooks/README.md#stakeholders).
 they are working on, folder, last hook event, when they were last seen and unread
 mail. A subagent sits under its parent. Ended sessions, sessions away for more than
 a day and bare family addresses are hidden until you tick *show ended and idle*.
+
+## The Viewer app
+
+`viewer/` is a small Windows app that shows the hub's pages in a window of their own,
+with no tabs, address bar or browser menus. It uses WebView2, the Chromium engine
+that ships with Windows 11, so there is nothing else to install. The pages recognize
+it and drop their browser-only parts; STOP NOW stays. Right-click for the pages,
+reload, zoom and always-on-top; a task opened from the board gets a viewer window of
+its own. See [viewer/README.md](viewer/README.md) to build it and point it at a hub.
 
 ## The Rules page
 

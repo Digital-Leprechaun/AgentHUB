@@ -28,6 +28,18 @@
   `HUB_STAKEHOLDERS` (default `STAKEHOLDERS.md` in `HUB_DOCS_DIR`) whenever it changes
   and serves it at `/api/stakeholders` and in `/api/tasks`. Tests:
   `test_stakeholders.py`.
+- **Clicking a task no longer changes it.** A click opens the task in a window of its
+  own (`/task.html?id=N`: full text, subtasks and every message tagged with it, kept
+  live); status changes move to a right-click menu (Start, Block, Set pending, Done,
+  Reopen).
+- **The board fits small screens**: each column's sessions fold into one line
+  ("3 active agents", bridges not counted), remembered per browser; the column
+  header shows only its task count; the whole board scrolls with both scrollbars
+  always shown; a long owner address no longer runs past its card.
+- **The Viewer app** (`viewer/`): the hub's pages in a Windows window of their own,
+  on WebView2, with a right-click menu for the pages, reload, zoom and always-on-top,
+  and a window of its own for each task. Pages seen through it (`AgentHubViewer` in
+  the user agent) drop their browser-only parts.
 
 ## 3.1.0
 
