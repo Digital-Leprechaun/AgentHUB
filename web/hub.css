@@ -72,6 +72,15 @@ form#composer{display:flex;gap:8px;padding:10px 16px;background:var(--panel);
 .col{background:var(--panel);border:1px solid var(--line);border-radius:9px;
   min-width:255px;max-width:320px;flex:1 0 255px;display:flex;flex-direction:column}
 .col.done{flex-basis:290px}
+/* A machine's columns sit together (claude@11 beside codex@11) in that machine's tint. */
+.hostgrp{flex:1 0 auto;display:flex;flex-direction:column;gap:6px;padding:6px 6px 8px;border-radius:12px;
+  background:color-mix(in srgb,var(--hc) 7%,transparent);
+  border:1px solid color-mix(in srgb,var(--hc) 30%,transparent)}
+.hostgrp > .hl{font-size:11px;font-weight:700;letter-spacing:.8px;color:var(--hc);padding:0 6px}
+.hostgrp > .hcols{display:flex;gap:8px;align-items:flex-start}
+.hostgrp .col{background:color-mix(in srgb,var(--hc) 6%,var(--panel));
+  border-color:color-mix(in srgb,var(--hc) 22%,var(--line))}
+.hostgrp .col > h2{border-bottom-color:color-mix(in srgb,var(--hc) 22%,var(--line))}
 .col > h2{margin:0;padding:10px 12px;font-size:13px;border-bottom:1px solid var(--line);
   display:flex;align-items:center;gap:7px}
 .col h2 .cnt{margin-left:auto;color:var(--dim);font-weight:500;font-size:11px}

@@ -21,7 +21,7 @@
   <input id="ntitle" placeholder="new task title…" autocomplete="off">
   <input id="nowner" placeholder="owner (claude@desk)" autocomplete="off" style="width:200px">
   <button id="add">add task</button>
-  <span class="hint">Columns are agent families (vendor@host). A task's subtasks sit inside its card,
+  <span class="hint">Columns are agent families (vendor@host), grouped and tinted by machine. A task's subtasks sit inside its card,
     each with the Worker running it (↳). A card's top edge is its stakeholder's color (grey: open). Click a card or subtask to read it in its own window;
     right-click it to change its status.</span>
 </section>
@@ -47,6 +47,9 @@ function stake(t){
   return { name: t.company ? t.company + ' (not in the stakeholder file)' : 'open', color: OPEN_COLOR,
            label: t.company || 'open' };
 }
+// Machine tints for the column groups: muted, and clear of the stakeholder colors.
+const HOST_TINTS = ['#6fa8dc', '#7fc8a9', '#d9b26f', '#c98fb5', '#8f9fd9'];
+
 const shStyle = s => ' style="--sh:' + escapeHtml(s.color) + '"';
 
 // Families whose agent list is unfolded. Folded by default; remembered in this browser
@@ -128,7 +131,9 @@ async function paint(){
     fams.get(f).tasks.push(t);
   });
 
-  const cols = [...fams.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([fam, d]) => {
+  // Columns are grouped by machine (claude@11 beside codex@11), each machine in its own tint.
+  const hostOf = fam => fam.split('@')[1] || fam;
+  const column = ([fam, d]) => {
     d.tasks.sort((x, y) => (ORDER[x.status] - ORDER[y.status]) || (y.id - x.id));
     // The agent list folds to one line ("3 active agents") to leave room for the cards.
     // A bridge is a service, so it is not counted as an agent; the header shows only the
@@ -156,7 +161,16 @@ async function paint(){
         : '<span class="a">no agent seen</span></div>') +
       '<div class="cards">' + (d.tasks.length ? d.tasks.map(card).join('')
         : '<div class="empty">nothing in flight</div>') + '</div></div>';
+  };
+  const hosts = new Map();
+  [...fams.entries()].sort((a, b) => a[0].localeCompare(b[0])).forEach(e => {
+    const h = hostOf(e[0]);
+    if (!hosts.has(h)) hosts.set(h, []);
+    hosts.get(h).push(e);
   });
+  const cols = [...hosts.entries()].map(([host, list], i) =>
+    '<div class="hostgrp" style="--hc:' + HOST_TINTS[i % HOST_TINTS.length] + ';flex-grow:' + list.length + '">' +
+    '<div class="hl">@' + escapeHtml(host) + '</div><div class="hcols">' + list.map(column).join('') + '</div></div>');
 
   done.sort((a, b) => (b.done_at || '').localeCompare(a.done_at || '') || b.id - a.id);
   cols.push('<div class="col done"><h2>Completed<span class="cnt">' + done.length + '</span></h2>' +
