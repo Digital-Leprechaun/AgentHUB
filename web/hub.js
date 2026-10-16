@@ -139,6 +139,12 @@ function taskMenu(root, after){
     const items = [['Open in window', () => openTask(id)], null];
     if (closed) items.push(['Reopen', 'pending']);
     else {
+      if (cur === 'active' || cur === 'planning') items.push(['Stop', async () => {
+        try { const r = await api('/api/task/stop', 'POST', { as: identity().me, id });
+              if (r.note) alert(r.note); }
+        catch (err) { alert(err.message); }
+        if (after) after();
+      }]);
       if (cur !== 'active') items.push(['Start', 'active']);
       if (cur !== 'blocked') items.push(['Block', 'blocked']);
       if (cur !== 'pending') items.push(['Set pending', 'pending']);

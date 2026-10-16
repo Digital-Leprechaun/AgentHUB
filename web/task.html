@@ -42,9 +42,14 @@ async function paint(){
   document.getElementById('tid').textContent = 'task #' + t.id;
   msgs.sort((a, b) => a.id - b.id);
 
+  const running = t.status === 'active' || t.status === 'planning';
+  const closed = t.status === 'done' || t.status === 'elevated';
   view.innerHTML =
     '<section class="card ' + t.status + '" data-id="' + t.id + '">' +
-      '<div class="t">' + escapeHtml(t.title) + '</div>' +
+      '<div class="tbar"><div class="t">' + escapeHtml(t.title) + '</div>' +
+        (running ? '<button class="stopbtn" id="stoptask" title="Stop the sessions working on this task and mark it blocked">STOP</button>' : '') +
+        (!closed ? '<button class="donebtn" id="donetask" title="Move this task to Completed">DONE</button>' : '') +
+      '</div>' +
       '<div class="f"><span class="badge ' + t.status + '">' + t.status + '</span>' +
       (t.topic ? '<span class="topic">#' + escapeHtml(t.topic) + '</span>' : '') + '</div>' +
       (t.body ? '<div class="b">' + escapeHtml(t.body) + '</div>' : '') +
@@ -72,6 +77,22 @@ async function paint(){
       '<div class="body">' + escapeHtml(m.body) + '</div></div>').join('')
       : '<div class="empty">no messages tagged with this task</div>');
 }
+
+// STOP and DONE act at once: only a human uses these pages.
+view.addEventListener('click', async e => {
+  const b = e.target.closest('#stoptask, #donetask');
+  if (!b) return;
+  b.disabled = true;
+  try {
+    if (b.id === 'stoptask') {
+      const r = await api('/api/task/stop', 'POST', { as: identity().me, id: ID });
+      if (r.note) alert(r.note);
+    } else {
+      await api('/api/task/update', 'POST', { as: identity().me, id: ID, status: 'done' });
+    }
+  } catch (err) { alert(err.message); }
+  paint();
+});
 
 taskMenu(view, paint);
 subscribe(ev => { if (ev.type === 'task' || ev.type === 'message') paint(); });

@@ -225,6 +225,43 @@ try:
     check("runner socket gets a resume event", "resume" in kinds, kinds)
     ws.close()
 
+    print("\nstopping one task (the board's STOP button)")
+
+    def post(path, body, token):
+        r = urllib.request.Request(f"{BASE}{path}", data=json.dumps(body).encode(),
+                                   headers={"Content-Type": "application/json",
+                                            "Authorization": f"Bearer {token}"})
+        try:
+            with urllib.request.urlopen(r, timeout=10) as resp:
+                return resp.status, json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    orch = "claude@desk/aaaa1111"
+    prim = call("hub_task_create", {"as": orch, "title": "stoppable", "status": "active"})["task"]
+    kid = call("hub_task_create", {"as": orch, "title": "its subtask", "parent_id": prim["id"],
+                                   "worker": "claude@11/bbbb2222", "status": "active"})["task"]
+    other = call("hub_task_create", {"as": "claude@desk/cccc3333", "title": "bystander",
+                                     "status": "active"})["task"]
+    code, r = post("/api/task/stop", {"as": "claude@desk", "id": prim["id"]}, "t-desk")
+    check("an agent may not stop a task (403)", code == 403, r)
+    code, r = post("/api/task/stop", {"as": "human@hub", "id": prim["id"]}, "t-human")
+    targets = sorted(s["target"] for s in r.get("stops", []))
+    check("a human stops the task's Orchestrator and its Worker",
+          code == 200 and targets == ["claude@11/bbbb2222", orch], r)
+    check("the task is blocked", r.get("task", {}).get("status") == "blocked", r)
+    tasks = {t["id"]: t for t in json.loads(get("/api/tasks"))["tasks"]}
+    check("its open subtask is blocked", tasks[kid["id"]]["status"] == "blocked", tasks.get(kid["id"]))
+    check("another task is untouched", tasks[other["id"]]["status"] == "active", tasks.get(other["id"]))
+    check("the bystander's session is not stopped",
+          not call("hub_stops", {"as": "claude@desk/cccc3333"})["stops"]
+          or all(s["target"] != "claude@desk/cccc3333" for s in call("hub_stops", {"as": "human@hub"})["stops"]), "")
+    solo = call("hub_task_create", {"as": "claude@desk", "title": "family-owned", "status": "active"})["task"]
+    code, r = post("/api/task/stop", {"as": "human@hub", "id": solo["id"]}, "t-human")
+    check("a task with no session only gets blocked", code == 200 and not r["stops"] and r["note"], r)
+    for s in call("hub_stops", {"as": "human@hub"})["stops"]:
+        call("hub_resume", {"as": "human@hub", "id": s["id"]})
+
     print("\n" + ("ALL PASS" if not FAILS else f"{len(FAILS)} FAILURE(S): " + ", ".join(FAILS)))
 finally:
     proc.terminate()

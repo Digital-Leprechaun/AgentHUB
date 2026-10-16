@@ -258,3 +258,9 @@ main.taskview{flex:1;overflow-y:auto;padding:12px 14px 30px}
 .taskview h3 .cnt{color:var(--dim);font-weight:500;font-size:11px}
 .taskview .kids{display:flex;flex-direction:column;gap:3px}
 .taskview .msg .meta{display:flex;margin-top:0;font-size:11px}
+/* STOP and DONE on a task's own window. */
+.taskview .tbar{display:flex;align-items:flex-start;gap:8px}
+.taskview .tbar .t{flex:1}
+.taskview .stopbtn{background:#c93b3b;color:#fff;letter-spacing:.5px}
+.taskview .donebtn{background:var(--done);color:#0d1014;letter-spacing:.5px}
+.taskview .tbar button:disabled{opacity:.5;cursor:wait}

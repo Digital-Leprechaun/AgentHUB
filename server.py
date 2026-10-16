@@ -2542,18 +2542,52 @@ class Hub:
             if target in (str(me).lower(), me.family):
                 raise HubError("an agent cannot stop itself")
         verified = self.tokens.enforced and self.tokens.verify(me, token)
-        s = self.store.stop_create(me, args.get("reason", ""), target, args.get("domain", ""))
-        label = "STOP NOW" if s["scope"] == "all" else f"STOP {target}"
-        dom = f" [domain: {s['domain']}]" if s["domain"] else ""
-        msg = self.store.post(me, f"{label} (stop #{s['id']}){dom}: {s['reason']}",
-                              [] if target is None else [target], "", None, verified)
-        self._notify(msg)
-        self._push_stop(s, "stop")
+        s = self._issue_stop(me, target, args.get("reason", ""), args.get("domain", ""), verified)
         out = {"stop": s}
         if target is not None:
             out["note"] = ("The hub does not check domain ownership yet. A targeted stop is "
                            "legitimate only when the target is working in your domain.")
         return out
+
+    def _issue_stop(self, me: Addr, target: str | None, reason: str, domain: str, verified: bool,
+                    task_id: int | None = None) -> dict:
+        s = self.store.stop_create(me, reason, target, domain)
+        label = "STOP NOW" if s["scope"] == "all" else f"STOP {target}"
+        dom = f" [domain: {s['domain']}]" if s["domain"] else ""
+        msg = self.store.post(me, f"{label} (stop #{s['id']}){dom}: {s['reason']}",
+                              [] if target is None else [target], "", None, verified, task_id)
+        self._notify(msg)
+        self._push_stop(s, "stop")
+        return s
+
+    def task_stop(self, args: dict, token: str | None) -> dict:
+        """A human stops one task from its window: every session working on it gets a
+        targeted stop, and the task (with its open subtasks) is marked blocked. For a
+        primary task that is its Orchestrator and its subtasks' Workers; for a subtask,
+        only its Worker. A bare family (no session has taken the work) is not stopped,
+        since that would stop every session on the machine."""
+        me = Addr.parse(args.get("as", ""))
+        if not self.is_human(me, token):
+            raise HubForbidden(f"only a human ({', '.join(sorted(HUMANS))}) may stop a task")
+        t = self.store.task(int(args["id"]))
+        kids = [] if t["parent_id"] is not None else [
+            dict(r) for r in self.store.q("SELECT * FROM tasks WHERE parent_id=?"
+                                          " AND status NOT IN ('done','elevated')", (t["id"],))]
+        who = [t["worker"]] if t["parent_id"] is not None else [t["owner"], t["worker"]]
+        who += [k["worker"] for k in kids]
+        targets = []
+        for w in sorted({(w or "").lower() for w in who if w and "/" in w}, key=len):
+            if not any(w.startswith(x + "/") for x in targets):   # a session's stop covers its subagents
+                targets.append(w)
+        reason = (args.get("reason") or "").strip() or f"task #{t['id']} stopped from the board: {t['title']}"
+        verified = self.tokens.enforced and self.tokens.verify(me, token)
+        stops = [self._issue_stop(me, w, reason, "", verified, t["id"]) for w in targets]
+        for x in [t] + kids:
+            if x["status"] not in CLOSED_STATUSES:
+                self.watchers.push("task", self.store.task_update(me, x["id"], status="blocked"))
+        log(f"task #{t['id']} stopped by {me}: {len(stops)} session(s)")
+        return {"task": self.store.task(t["id"]), "stops": stops,
+                "note": "" if stops else "no session was working on it; the task is marked blocked"}
 
     def t_hub_resume(self, args: dict, token: str | None) -> dict:
         me = self._me(args, token)
@@ -3126,6 +3160,8 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/task":
                 res = HUB.call("hub_task_create", body, self.token())
                 self.send_json(res)
+            elif path == "/api/task/stop":
+                self.send_json(HUB.task_stop(body, self.token()))
             elif path == "/api/task/update":
                 res = HUB.call("hub_task_update", body, self.token())
                 self.send_json(res)
