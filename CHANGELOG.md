@@ -1,5 +1,28 @@
 # Changelog
 
+## 3.3.0
+
+- **The board groups columns by machine.** `claude@lab` sits beside `codex@lab` inside
+  a labelled `@lab` group, and each machine's group and columns take a muted tint of
+  their own, chosen to stay clear of the stakeholder colors.
+- **STOP and DONE in the task window.** STOP (shown while a task is active or
+  planning) gives a targeted stop to every session working on the task -- a primary
+  task's Orchestrator and its subtasks' Workers, or a subtask's Worker -- and marks the
+  task and its open subtasks blocked. A task no session has taken is only marked
+  blocked: stopping a bare family would stop every session on that machine. DONE moves
+  the task to Completed. Both are for humans only (new `POST /api/task/stop`; status
+  changes already were); the right-click menu gains Stop too. Lift the stop from the
+  red bar as before.
+- **Fixed: the board stopped refreshing with task windows open.** Every hub page held
+  its own live-update stream, and a browser allows six connections to one host; the
+  Viewer's task windows share one browser engine, so a few of them starved the board's
+  requests until a page was closed. Now one page holds the only stream (a Web Lock)
+  and passes each event to the others over a `BroadcastChannel`; when it closes,
+  another takes over.
+- **Fixed: a Viewer run from its build folder showed "connection refused".** Without a
+  `viewer.json` beside it the Viewer falls back to `http://localhost:8787`. Run the
+  published copy (`viewer/publish`), or copy `viewer.json` next to the build.
+
 ## 3.2.0
 
 - **Stakeholders**: the company a piece of work is for. A master `STAKEHOLDERS.md`

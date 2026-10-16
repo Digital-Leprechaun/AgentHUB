@@ -264,7 +264,8 @@ execution and reviews are not capped. The board shows the count on planning card
 ## The board
 
 One column per **family** (`vendor@host`): every `claude@desk` session lands in one
-column, its in-flight and pending tasks as cards. The column's sessions fold into one
+column, its in-flight and pending tasks as cards. Columns are grouped by machine
+(`claude@desk` beside `codex@desk`, under `@desk`), each machine in a tint of its own. The column's sessions fold into one
 line (`▸ 3 active agents`; bridges are not counted) that opens to the list with a
 presence dot each; the browser remembers which lists are open. A task's subtasks sit
 inside its card, each with the Worker running it on the line below
@@ -274,8 +275,13 @@ scrolls, with both scrollbars always shown.
 
 **Clicking** a card or subtask only opens it in a window of its own (`/task.html?id=N`):
 its full text, owner, worker, primary task, times, subtasks and every message tagged
-with it, kept live. **Right-click** changes its status: Start, Block, Set pending,
-Done, or Reopen for a finished one. A click never moves work.
+with it, kept live, with a **STOP** button while it is active or planning and a **DONE**
+button until it is finished. STOP stops the sessions working on the task (its
+Orchestrator and its subtasks' Workers, or a subtask's Worker) and marks it blocked;
+lift the stop from the red bar. **Right-click** changes its status: Start, Stop, Block,
+Set pending, Done, or Reopen for a finished one. A click never moves work. STOP, DONE
+and status changes need a human identity (`HUB_HUMANS` and its token), set once per
+browser with **identity** on the board; the Viewer keeps its own.
 
 A card's left edge is its status; its top edge, and a dot in its footer, are its
 **stakeholder's** color (a subtask shows it on its right edge). Open tasks, and tasks

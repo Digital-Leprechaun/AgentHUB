@@ -67,7 +67,7 @@ MAX_BODY = 32000
 MAX_WAIT = 60
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_NAME = "agenthub"
-SERVER_VERSION = "3.2.0"
+SERVER_VERSION = "3.3.0"
 
 # A family-addressed request (claude@desk, anyone@desk) that no bridge claims within
 # this long is escalated to the humans and the sender.
