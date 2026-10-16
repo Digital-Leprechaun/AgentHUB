@@ -19,24 +19,37 @@ async function api(path, method = 'GET', body = null){
   return data;
 }
 
-// Live updates. One stream per page, shared by every subscriber: a browser allows only
-// six connections to the hub, and each open stream holds one. Reconnects on drop.
+// Live updates. A browser allows only six connections to the hub, and an open stream
+// holds one for as long as the page lives, so every page of the hub in this browser
+// (tabs, and the Viewer's task windows) shares ONE stream: whichever page holds the
+// 'hub-events' lock opens it and passes each event to the others over a
+// BroadcastChannel. When that page closes, the lock passes to another page, which opens
+// the stream in its place. Reconnects on drop.
 const listeners = [];
-let stream = null;
+let subscribed = false;
 function subscribe(onEvent){
   listeners.push(onEvent);
-  if (stream) return;
-  const open = () => {
-    stream = new EventSource('/events');
-    ['message', 'task', 'stop', 'resume', 'doc'].forEach(name =>
-      stream.addEventListener(name, e => {
+  if (subscribed) return;
+  subscribed = true;
+  const deliver = (type, data) => listeners.forEach(fn => { try { fn({ type, data }); } catch {} });
+  const chan = 'BroadcastChannel' in window ? new BroadcastChannel('hub-events') : null;
+  const stream = () => {
+    const es = new EventSource('/events');
+    ['message', 'task', 'stop', 'resume', 'doc'].forEach(type =>
+      es.addEventListener(type, e => {
         let data;
         try { data = JSON.parse(e.data); } catch { return; }
-        listeners.forEach(fn => { try { fn({ type: name, data }); } catch {} });
+        deliver(type, data);
+        if (chan) chan.postMessage({ type, data });   // never echoed back to this page
       }));
-    stream.onerror = () => { stream.close(); setTimeout(open, 2000); };
+    es.onerror = () => { es.close(); setTimeout(stream, 2000); };
   };
-  open();
+  if (chan && navigator.locks) {
+    chan.onmessage = e => deliver(e.data.type, e.data.data);
+    navigator.locks.request('hub-events', () => { stream(); return new Promise(() => {}); });
+  } else {
+    stream();
+  }
 }
 
 function stateDot(state){
